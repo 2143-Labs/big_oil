@@ -1,0 +1,893 @@
+{
+ "next_change_id": "eJwVzDEKwzAQBMC_KF0KcdLJllyIYxvs2A-BK-1aB8aYkL9nd5jmmLXnVWqdXqcMnJ1O5Tdf3mQyP5jS",
+ "stashes": [
+  {
+   "id": "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+   "public": true,
+   "accountName": "FixtureSeller#0001",
+   "lastCharacterName": "FixtureChar",
+   "stash": "Dump",
+   "stashType": "PremiumStash",
+   "league": "Standard",
+   "items": [
+    {
+     "verified": true,
+     "w": 2,
+     "h": 1,
+     "icon": "https://web.poecdn.com/gen/image/WzI1LDE0LHsiZiI6IjJESXRlbXMvQmVsdHMvSGVhZGh1bnRlciIsInciOjIsImgiOjEsInNjYWxlIjoxfV0/e9542ec6ee/Headhunter.png",
+     "league": "Standard",
+     "id": "012f6529d744c504f1ed40be4cda11be1f12602f10fe1d0432e01c08245cb48c",
+     "name": "Headhunter",
+     "typeLine": "Leather Belt",
+     "baseType": "Leather Belt",
+     "rarity": "Unique",
+     "ilvl": 85,
+     "identified": true,
+     "properties": [
+      {
+       "name": "Quality (Attribute Modifiers)",
+       "values": [
+        [
+         "+20%",
+         1
+        ]
+       ],
+       "displayMode": 0,
+       "type": 6
+      }
+     ],
+     "requirements": [
+      {
+       "name": "Level",
+       "values": [
+        [
+         "40",
+         0
+        ]
+       ],
+       "displayMode": 0,
+       "type": 62
+      }
+     ],
+     "implicitMods": [
+      {
+       "description": "+40 to maximum Life",
+       "domain": "implicit",
+       "hash": "stat.implicit.stat_3299347043",
+       "mods": [
+        {
+         "level": 10,
+         "magnitudes": [
+          {
+           "min": "25",
+           "max": "40"
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "explicitMods": [
+      {
+       "description": "+64 to Strength",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_4080418644",
+       "mods": [
+        {
+         "magnitudes": [
+          {
+           "min": "40",
+           "max": "55"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+64 to Dexterity",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3261801346",
+       "mods": [
+        {
+         "magnitudes": [
+          {
+           "min": "40",
+           "max": "55"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+52 to maximum Life",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3299347043",
+       "mods": [
+        {
+         "level": 50,
+         "magnitudes": [
+          {
+           "min": "50",
+           "max": "60"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "27% increased Damage with Hits against Rare monsters",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_2137878565",
+       "mods": [
+        {
+         "magnitudes": [
+          {
+           "min": "20",
+           "max": "30"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "When you Kill a Rare monster, you gain its Modifiers for 60 seconds",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_2913235441",
+       "mods": [
+        {
+         "magnitudes": [
+          {
+           "min": "20000",
+           "max": "20000"
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "flavourText": [
+      "\"A man's soul rules from a cavern of bone, learns and\r",
+      "judges through flesh-born windows. The heart is meat.\r",
+      "The head is where the Man is.\"\r",
+      "- Lavianga, Advisor to Kaom"
+     ],
+     "frameType": 3,
+     "frameTypeId": "Unique",
+     "extended": {
+      "hashes": {
+       "explicit": [
+        [
+         "explicit.stat_4080418644",
+         [
+          3
+         ]
+        ],
+        [
+         "explicit.stat_3261801346",
+         [
+          4
+         ]
+        ],
+        [
+         "explicit.stat_3299347043",
+         [
+          2
+         ]
+        ],
+        [
+         "explicit.stat_2137878565",
+         [
+          0
+         ]
+        ],
+        [
+         "explicit.stat_2913235441",
+         [
+          1
+         ]
+        ]
+       ],
+       "implicit": [
+        [
+         "implicit.stat_3299347043",
+         [
+          0
+         ]
+        ]
+       ]
+      },
+      "text": "SXRlbSBDbGFzczogQmVsdHMNClJhcml0eTogVW5pcXVlDQpIZWFkaHVudGVyDQpMZWF0aGVyIEJlbHQNCi0tLS0tLS0tDQpRdWFsaXR5IChBdHRyaWJ1dGUgTW9kaWZpZXJzKTogKzIwJSAoYXVnbWVudGVkKQ0KLS0tLS0tLS0NClJlcXVpcmVtZW50czoNCkxldmVsOiA0MA0KLS0tLS0tLS0NCkl0ZW0gTGV2ZWw6IDg1DQotLS0tLS0tLQ0KKzQwIHRvIG1heGltdW0gTGlmZQ0KLS0tLS0tLS0NCis2NCB0byBTdHJlbmd0aA0KKzY0IHRvIERleHRlcml0eQ0KKzUyIHRvIG1heGltdW0gTGlmZQ0KMjclIGluY3JlYXNlZCBEYW1hZ2Ugd2l0aCBIaXRzIGFnYWluc3QgUmFyZSBtb25zdGVycw0KV2hlbiB5b3UgS2lsbCBhIFJhcmUgbW9uc3RlciwgeW91IGdhaW4gaXRzIE1vZGlmaWVycyBmb3IgNjAgc2Vjb25kcw0KLS0tLS0tLS0NCiJBIG1hbidzIHNvdWwgcnVsZXMgZnJvbSBhIGNhdmVybiBvZiBib25lLCBsZWFybnMgYW5kDQpqdWRnZXMgdGhyb3VnaCBmbGVzaC1ib3JuIHdpbmRvd3MuIFRoZSBoZWFydCBpcyBtZWF0Lg0KVGhlIGhlYWQgaXMgd2hlcmUgdGhlIE1hbiBpcy4iDQotIExhdmlhbmdhLCBBZHZpc29yIHRvIEthb20NCg=="
+     },
+     "note": "~b/o 120 chaos"
+    },
+    {
+     "verified": true,
+     "w": 2,
+     "h": 2,
+     "icon": "https://web.poecdn.com/gen/image/WzI1LDE0LHsiZiI6IjJESXRlbXMvQXJtb3Vycy9IZWxtZXRzL0hlbG1ldERleDIiLCJ3IjoyLCJoIjoyLCJzY2FsZSI6MX1d/c4c9b53e80/HelmetDex2.png",
+     "league": "Standard",
+     "id": "6156d8c25400d83b53cc76051fd702ea74199c77e02bc22c5e83a5d9040e7e02",
+     "sockets": [
+      {
+       "group": 0,
+       "attr": "D",
+       "sColour": "G"
+      },
+      {
+       "group": 0,
+       "attr": "D",
+       "sColour": "G"
+      }
+     ],
+     "name": "Dragon Veil",
+     "typeLine": "Tricorne",
+     "baseType": "Tricorne",
+     "rarity": "Rare",
+     "ilvl": 17,
+     "identified": true,
+     "note": "~b/o 15 chaos",
+     "properties": [
+      {
+       "name": "Evasion Rating",
+       "values": [
+        [
+         "57",
+         1
+        ]
+       ],
+       "displayMode": 0,
+       "type": 17
+      }
+     ],
+     "requirements": [
+      {
+       "name": "Level",
+       "values": [
+        [
+         "11",
+         0
+        ]
+       ],
+       "displayMode": 0,
+       "type": 62
+      },
+      {
+       "name": "Dex",
+       "values": [
+        [
+         "27",
+         0
+        ]
+       ],
+       "displayMode": 1,
+       "type": 64
+      }
+     ],
+     "explicitMods": [
+      {
+       "description": "+1 to Level of Socketed Minion Gems",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3604946673",
+       "mods": [
+        {
+         "name": "Reanimator's",
+         "tier": "P0",
+         "level": 14,
+         "magnitudes": [
+          {
+           "min": "1",
+           "max": "1"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+7 to Accuracy Rating",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_803737631",
+       "mods": [
+        {
+         "name": "of Calm",
+         "tier": "S0",
+         "magnitudes": [
+          {
+           "min": "5",
+           "max": "15"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+4 to Evasion Rating",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_53045048",
+       "mods": [
+        {
+         "name": "Agile",
+         "tier": "P8",
+         "magnitudes": [
+          {
+           "min": "6",
+           "max": "12"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "8% increased Rarity of Items found",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3917489142",
+       "mods": [
+        {
+         "name": "of Plunder",
+         "tier": "S4",
+         "level": 3,
+         "magnitudes": [
+          {
+           "min": "6",
+           "max": "10"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+9% to Fire Resistance",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3372524247",
+       "mods": [
+        {
+         "name": "of the Whelpling",
+         "tier": "S8",
+         "magnitudes": [
+          {
+           "min": "6",
+           "max": "11"
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "frameType": 2,
+     "frameTypeId": "Rare",
+     "extended": {
+      "base_defence_percentile": 0,
+      "ev": 68,
+      "ev_aug": true,
+      "hashes": {
+       "explicit": [
+        [
+         "explicit.stat_3604946673",
+         [
+          3
+         ]
+        ],
+        [
+         "explicit.stat_803737631",
+         [
+          1
+         ]
+        ],
+        [
+         "explicit.stat_53045048",
+         [
+          4
+         ]
+        ],
+        [
+         "explicit.stat_3917489142",
+         [
+          0
+         ]
+        ],
+        [
+         "explicit.stat_3372524247",
+         [
+          2
+         ]
+        ]
+       ]
+      },
+      "text": "SXRlbSBDbGFzczogSGVsbWV0cw0KUmFyaXR5OiBSYXJlDQpEcmFnb24gVmVpbA0KVHJpY29ybmUNCi0tLS0tLS0tDQpFdmFzaW9uIFJhdGluZzogNTcgKGF1Z21lbnRlZCkNCi0tLS0tLS0tDQpSZXF1aXJlbWVudHM6DQpMZXZlbDogMTENCkRleDogMjcNCi0tLS0tLS0tDQpTb2NrZXRzOiBHLUcgDQotLS0tLS0tLQ0KSXRlbSBMZXZlbDogMTcNCi0tLS0tLS0tDQorMSB0byBMZXZlbCBvZiBTb2NrZXRlZCBNaW5pb24gR2Vtcw0KKzcgdG8gQWNjdXJhY3kgUmF0aW5nDQorNCB0byBFdmFzaW9uIFJhdGluZw0KOCUgaW5jcmVhc2VkIFJhcml0eSBvZiBJdGVtcyBmb3VuZA0KKzklIHRvIEZpcmUgUmVzaXN0YW5jZQ0KLS0tLS0tLS0NCk5vdGU6IH5wcmljZSAwLjQyIGFsY2gNCg=="
+     }
+    }
+   ]
+  },
+  {
+   "id": "e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718",
+   "public": true,
+   "accountName": "FixtureSeller#0001",
+   "lastCharacterName": "FixtureChar",
+   "stash": "Currency",
+   "stashType": "CurrencyStash",
+   "league": "Standard",
+   "items": [
+    {
+     "verified": true,
+     "w": 1,
+     "h": 1,
+     "icon": "https://web.poecdn.com/gen/image/WzI1LDE0LHsiZiI6IjJESXRlbXMvQ3VycmVuY3kvQ3VycmVuY3lSZXJvbGxSYXJlIiwidyI6MSwiaCI6MSwic2NhbGUiOjF9XQ/d119a0d734/CurrencyRerollRare.png",
+     "stackSize": 2,
+     "maxStackSize": 20,
+     "league": "Standard",
+     "id": "1014cdda1cd1d996b37aeff9e8b2efb30e27ee7221113c5698792e7c59a214c7",
+     "name": "",
+     "typeLine": "Chaos Orb",
+     "baseType": "Chaos Orb",
+     "ilvl": 0,
+     "identified": true,
+     "properties": [
+      {
+       "name": "Stack Size",
+       "values": [
+        [
+         "2/20",
+         0
+        ]
+       ],
+       "displayMode": 0,
+       "type": 32
+      }
+     ],
+     "explicitMods": [
+      {
+       "description": "Reforges a rare item with new random modifiers"
+      }
+     ],
+     "descrText": "Right click this item then left click a rare item to apply it.",
+     "frameType": 5,
+     "frameTypeId": "Currency",
+     "extended": {
+      "text": "SXRlbSBDbGFzczogU3RhY2thYmxlIEN1cnJlbmN5DQpSYXJpdHk6IEN1cnJlbmN5DQpDaGFvcyBPcmINCi0tLS0tLS0tDQpTdGFjayBTaXplOiAyLzIwDQotLS0tLS0tLQ0KUmVmb3JnZXMgYSByYXJlIGl0ZW0gd2l0aCBuZXcgcmFuZG9tIG1vZGlmaWVycw0KLS0tLS0tLS0NClJpZ2h0IGNsaWNrIHRoaXMgaXRlbSB0aGVuIGxlZnQgY2xpY2sgYSByYXJlIGl0ZW0gdG8gYXBwbHkgaXQuDQpTaGlmdCBjbGljayB0byB1bnN0YWNrLg0K"
+     },
+     "note": "~b/o 1 divine"
+    },
+    {
+     "verified": true,
+     "w": 1,
+     "h": 1,
+     "icon": "https://web.poecdn.com/gen/image/WzMwLDE0LHsiZiI6IjJESXRlbXMvR2Vtcy9WYWFsR2Vtcy9WYWFsRmlyZWJhbGwiLCJ3IjoxLCJoIjoxLCJzY2FsZSI6MX1d/a5d62b561c/VaalFireball.png",
+     "support": false,
+     "league": "Standard",
+     "id": "238915d2d28073c5d0e21182b373dda9ba3f8f1e0d7b843883c7a05b8015a88c",
+     "name": "",
+     "typeLine": "Vaal Fireball",
+     "baseType": "Vaal Fireball",
+     "ilvl": 0,
+     "identified": true,
+     "corrupted": true,
+     "properties": [
+      {
+       "name": "Projectile, Spell, AoE, Vaal, Fire",
+       "values": [],
+       "displayMode": 0
+      },
+      {
+       "name": "Level",
+       "values": [
+        [
+         "1",
+         0
+        ]
+       ],
+       "displayMode": 0,
+       "type": 5
+      },
+      {
+       "name": "Cost",
+       "values": [
+        [
+         "5 Mana",
+         0
+        ]
+       ],
+       "displayMode": 0
+      },
+      {
+       "name": "Cast Time",
+       "values": [
+        [
+         "0.75 sec",
+         0
+        ]
+       ],
+       "displayMode": 0
+      },
+      {
+       "name": "Critical Strike Chance",
+       "values": [
+        [
+         "5.00%",
+         0
+        ]
+       ],
+       "displayMode": 0
+      },
+      {
+       "name": "Effectiveness of Added Damage",
+       "values": [
+        [
+         "300%",
+         0
+        ]
+       ],
+       "displayMode": 0
+      }
+     ],
+     "requirements": [
+      {
+       "name": "Level",
+       "values": [
+        [
+         "1",
+         0
+        ]
+       ],
+       "displayMode": 0,
+       "type": 62
+      }
+     ],
+     "additionalProperties": [
+      {
+       "name": "Experience",
+       "values": [
+        [
+         "1/70",
+         0
+        ]
+       ],
+       "displayMode": 2,
+       "progress": 0.01,
+       "type": 20
+      }
+     ],
+     "secDescrText": "Unleashes a ball of fire towards a target which explodes, damaging nearby foes.",
+     "explicitMods": [
+      {
+       "description": "Deals 9 to 14 Fire Damage"
+      },
+      {
+       "description": "25% chance to Ignite enemies"
+      },
+      {
+       "description": "Base radius is 1 metre"
+      }
+     ],
+     "descrText": "Place into an item socket to gain this skill. Right click to remove from a socket.",
+     "frameType": 4,
+     "frameTypeId": "Gem",
+     "hybrid": {
+      "isVaalGem": true,
+      "baseTypeName": "Fireball",
+      "properties": [
+       {
+        "name": "Souls Per Use",
+        "values": [
+         [
+          "30",
+          0
+         ]
+        ],
+        "displayMode": 0
+       },
+       {
+        "name": "Can Store {0} Use",
+        "values": [
+         [
+          "1",
+          0
+         ]
+        ],
+        "displayMode": 3
+       },
+       {
+        "name": "Soul Gain Prevention",
+        "values": [
+         [
+          "4 sec",
+          0
+         ]
+        ],
+        "displayMode": 0
+       },
+       {
+        "name": "Cast Time",
+        "values": [
+         [
+          "0.75 sec",
+          0
+         ]
+        ],
+        "displayMode": 0
+       },
+       {
+        "name": "Critical Strike Chance",
+        "values": [
+         [
+          "5.00%",
+          0
+         ]
+        ],
+        "displayMode": 0
+       },
+       {
+        "name": "Effectiveness of Added Damage",
+        "values": [
+         [
+          "300%",
+          0
+         ]
+        ],
+        "displayMode": 0
+       }
+      ],
+      "explicitMods": [
+       "Deals 9 to 14 Fire Damage",
+       "Fires 32 Projectiles in a spiral",
+       "25% chance to Ignite enemies",
+       "Base radius is 1 metre"
+      ],
+      "secDescrText": "Launches a series of fireballs in a spiral around the caster."
+     },
+     "extended": {
+      "text": "SXRlbSBDbGFzczogU2tpbGwgR2Vtcw0KUmFyaXR5OiBHZW0NCkZpcmViYWxsDQotLS0tLS0tLQ0KUHJvamVjdGlsZSwgU3BlbGwsIEFvRSwgVmFhbCwgRmlyZQ0KTGV2ZWw6IDENCkNvc3Q6IDUgTWFuYQ0KQ2FzdCBUaW1lOiAwLjc1IHNlYw0KQ3JpdGljYWwgU3RyaWtlIENoYW5jZTogNS4wMCUNCkVmZmVjdGl2ZW5lc3Mgb2YgQWRkZWQgRGFtYWdlOiAzMDAlDQotLS0tLS0tLQ0KUmVxdWlyZW1lbnRzOg0KTGV2ZWw6IDENCi0tLS0tLS0tDQpVbmxlYXNoZXMgYSBiYWxsIG9mIGZpcmUgdG93YXJkcyBhIHRhcmdldCB3aGljaCBleHBsb2RlcywgZGFtYWdpbmcgbmVhcmJ5IGZvZXMuDQotLS0tLS0tLQ0KRGVhbHMgOSB0byAxNCBGaXJlIERhbWFnZQ0KMjUlIGNoYW5jZSB0byBJZ25pdGUgZW5lbWllcw0KQmFzZSByYWRpdXMgaXMgMSBtZXRyZQ0KLS0tLS0tLS0NClZhYWwgRmlyZWJhbGwNCi0tLS0tLS0tDQpTb3VscyBQZXIgVXNlOiAzMA0KQ2FuIFN0b3JlIDEgVXNlDQpTb3VsIEdhaW4gUHJldmVudGlvbjogNCBzZWMNCkNhc3QgVGltZTogMC43NSBzZWMNCkNyaXRpY2FsIFN0cmlrZSBDaGFuY2U6IDUuMDAlDQpFZmZlY3RpdmVuZXNzIG9mIEFkZGVkIERhbWFnZTogMzAwJQ0KLS0tLS0tLS0NCkxhdW5jaGVzIGEgc2VyaWVzIG9mIGZpcmViYWxscyBpbiBhIHNwaXJhbCBhcm91bmQgdGhlIGNhc3Rlci4NCi0tLS0tLS0tDQpEZWFscyA5IHRvIDE0IEZpcmUgRGFtYWdlDQpGaXJlcyAzMiBQcm9qZWN0aWxlcyBpbiBhIHNwaXJhbA0KMjUlIGNoYW5jZSB0byBJZ25pdGUgZW5lbWllcw0KQmFzZSByYWRpdXMgaXMgMSBtZXRyZQ0KLS0tLS0tLS0NCkV4cGVyaWVuY2U6IDEvNzANCi0tLS0tLS0tDQpQbGFjZSBpbnRvIGFuIGl0ZW0gc29ja2V0IHRvIGdhaW4gdGhpcyBza2lsbC4gUmlnaHQgY2xpY2sgdG8gcmVtb3ZlIGZyb20gYSBzb2NrZXQuDQotLS0tLS0tLQ0KQ29ycnVwdGVkDQo="
+     },
+     "note": "~b/o 3 chaos"
+    },
+    {
+     "verified": true,
+     "w": 1,
+     "h": 1,
+     "icon": "https://web.poecdn.com/gen/image/WzI1LDE0LHsiZiI6IjJESXRlbXMvRGl2aW5hdGlvbi9JbnZlbnRvcnlJY29uIiwidyI6MSwiaCI6MSwic2NhbGUiOjF9XQ/f34bf8cbb5/InventoryIcon.png",
+     "stackSize": 2,
+     "maxStackSize": 8,
+     "league": "Standard",
+     "id": "03308a54af1aa1bbd8a7bfb74e91fb842afe09769420acb909979d68af8aab28",
+     "name": "",
+     "typeLine": "The Doctor",
+     "baseType": "The Doctor",
+     "ilvl": 0,
+     "identified": true,
+     "properties": [
+      {
+       "name": "Stack Size",
+       "values": [
+        [
+         "2/8",
+         0
+        ]
+       ],
+       "displayMode": 0,
+       "type": 32
+      }
+     ],
+     "explicitMods": [
+      {
+       "description": "<uniqueitem>{Headhunter}"
+      }
+     ],
+     "flavourText": [
+      "\"They said I needed my head examined, but I'd rather just take yours.\" - Klopek the Cannibal"
+     ],
+     "frameType": 6,
+     "frameTypeId": "DivinationCard",
+     "artFilename": "TheDoctor",
+     "extended": {
+      "text": "SXRlbSBDbGFzczogRGl2aW5hdGlvbiBDYXJkcw0KUmFyaXR5OiBEaXZpbmF0aW9uIENhcmQNClRoZSBEb2N0b3INCi0tLS0tLS0tDQpTdGFjayBTaXplOiAyLzgNCi0tLS0tLS0tDQpIZWFkaHVudGVyDQotLS0tLS0tLQ0KIlRoZXkgc2FpZCBJIG5lZWRlZCBteSBoZWFkIGV4YW1pbmVkLCBidXQgSSdkIHJhdGhlciBqdXN0IHRha2UgeW91cnMuIiAtIEtsb3BlayB0aGUgQ2FubmliYWwNCi0tLS0tLS0tDQpTaGlmdCBjbGljayB0byB1bnN0YWNrLg0K"
+     },
+     "note": "~b/o 250 chaos"
+    }
+   ]
+  },
+  {
+   "id": "9988776699887766998877669988776699887766998877669988776699887766",
+   "public": true,
+   "accountName": "SecondSeller#0002",
+   "lastCharacterName": "Second",
+   "stash": "Shop",
+   "stashType": "PremiumStash",
+   "league": "Hardcore",
+   "items": [
+    {
+     "verified": true,
+     "w": 2,
+     "h": 2,
+     "icon": "https://web.poecdn.com/gen/image/WzI1LDE0LHsiZiI6IjJESXRlbXMvQXJtb3Vycy9IZWxtZXRzL0hlbG1ldERleDIiLCJ3IjoyLCJoIjoyLCJzY2FsZSI6MX1d/c4c9b53e80/HelmetDex2.png",
+     "league": "Standard",
+     "id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+     "sockets": [
+      {
+       "group": 0,
+       "attr": "D",
+       "sColour": "G"
+      },
+      {
+       "group": 0,
+       "attr": "D",
+       "sColour": "G"
+      }
+     ],
+     "name": "Doom Crest",
+     "typeLine": "Tricorne",
+     "baseType": "Tricorne",
+     "rarity": "Rare",
+     "ilvl": 85,
+     "identified": true,
+     "note": "~b/o 2 divine",
+     "properties": [
+      {
+       "name": "Evasion Rating",
+       "values": [
+        [
+         "57",
+         1
+        ]
+       ],
+       "displayMode": 0,
+       "type": 17
+      }
+     ],
+     "requirements": [
+      {
+       "name": "Level",
+       "values": [
+        [
+         "11",
+         0
+        ]
+       ],
+       "displayMode": 0,
+       "type": 62
+      },
+      {
+       "name": "Dex",
+       "values": [
+        [
+         "27",
+         0
+        ]
+       ],
+       "displayMode": 1,
+       "type": 64
+      }
+     ],
+     "explicitMods": [
+      {
+       "description": "+1 to Level of Socketed Minion Gems",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3604946673",
+       "mods": [
+        {
+         "name": "Reanimator's",
+         "tier": "P0",
+         "level": 14,
+         "magnitudes": [
+          {
+           "min": "1",
+           "max": "1"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+7 to Accuracy Rating",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_803737631",
+       "mods": [
+        {
+         "name": "of Calm",
+         "tier": "S0",
+         "magnitudes": [
+          {
+           "min": "5",
+           "max": "15"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+4 to Evasion Rating",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_53045048",
+       "mods": [
+        {
+         "name": "Agile",
+         "tier": "P8",
+         "magnitudes": [
+          {
+           "min": "6",
+           "max": "12"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "8% increased Rarity of Items found",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3917489142",
+       "mods": [
+        {
+         "name": "of Plunder",
+         "tier": "S4",
+         "level": 3,
+         "magnitudes": [
+          {
+           "min": "6",
+           "max": "10"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "description": "+9% to Fire Resistance",
+       "domain": "explicit",
+       "hash": "stat.explicit.stat_3372524247",
+       "mods": [
+        {
+         "name": "of the Whelpling",
+         "tier": "S8",
+         "magnitudes": [
+          {
+           "min": "6",
+           "max": "11"
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "frameType": 2,
+     "frameTypeId": "Rare",
+     "extended": {
+      "base_defence_percentile": 0,
+      "ev": 68,
+      "ev_aug": true,
+      "hashes": {
+       "explicit": [
+        [
+         "explicit.stat_3604946673",
+         [
+          3
+         ]
+        ],
+        [
+         "explicit.stat_803737631",
+         [
+          1
+         ]
+        ],
+        [
+         "explicit.stat_53045048",
+         [
+          4
+         ]
+        ],
+        [
+         "explicit.stat_3917489142",
+         [
+          0
+         ]
+        ],
+        [
+         "explicit.stat_3372524247",
+         [
+          2
+         ]
+        ]
+       ]
+      },
+      "text": "SXRlbSBDbGFzczogSGVsbWV0cw0KUmFyaXR5OiBSYXJlDQpEcmFnb24gVmVpbA0KVHJpY29ybmUNCi0tLS0tLS0tDQpFdmFzaW9uIFJhdGluZzogNTcgKGF1Z21lbnRlZCkNCi0tLS0tLS0tDQpSZXF1aXJlbWVudHM6DQpMZXZlbDogMTENCkRleDogMjcNCi0tLS0tLS0tDQpTb2NrZXRzOiBHLUcgDQotLS0tLS0tLQ0KSXRlbSBMZXZlbDogMTcNCi0tLS0tLS0tDQorMSB0byBMZXZlbCBvZiBTb2NrZXRlZCBNaW5pb24gR2Vtcw0KKzcgdG8gQWNjdXJhY3kgUmF0aW5nDQorNCB0byBFdmFzaW9uIFJhdGluZw0KOCUgaW5jcmVhc2VkIFJhcml0eSBvZiBJdGVtcyBmb3VuZA0KKzklIHRvIEZpcmUgUmVzaXN0YW5jZQ0KLS0tLS0tLS0NCk5vdGU6IH5wcmljZSAwLjQyIGFsY2gNCg=="
+     }
+    }
+   ]
+  }
+ ]
+}
