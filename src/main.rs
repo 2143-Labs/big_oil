@@ -14,6 +14,8 @@ use big_oil::auth;
 use big_oil::client::{self, Client};
 use big_oil::config::Config;
 use big_oil::model::StashPage;
+use big_oil::ninja::{self, NinjaClient, Overview};
+use big_oil::own::OwnClient;
 use big_oil::render;
 use big_oil::store::{self, Order, SearchQuery, Store};
 
@@ -63,6 +65,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Your own stash tabs (needs POESESSID)
+    Stash {
+        #[command(subcommand)]
+        cmd: StashCommand,
+    },
+    /// poe.ninja economy data (no auth)
+    Ninja {
+        #[command(subcommand)]
+        cmd: NinjaCommand,
+    },
     /// Print config, token and database paths
     Paths,
 }
@@ -108,6 +120,66 @@ struct Auth {
     check: bool,
 }
 
+#[derive(Subcommand)]
+enum StashCommand {
+    /// Poll your tabs, record what you drop, and price it
+    Watch(StashWatch),
+    /// Summarise the tabs scanned so far
+    List,
+    /// Re-value own-tab items from the stored economy snapshot
+    Value {
+        #[arg(long, env = "BIG_OIL_LEAGUE")]
+        league: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct StashWatch {
+    #[arg(long, env = "BIG_OIL_LEAGUE")]
+    league: String,
+    /// One pass, then exit
+    #[arg(long)]
+    once: bool,
+    /// Seconds between passes
+    #[arg(long, default_value_t = 120)]
+    interval: u64,
+    /// Comma-separated tab indexes to scan (default: every visible tab)
+    #[arg(long)]
+    tabs: Option<String>,
+    /// Refresh poe.ninja prices before the first pass
+    #[arg(long)]
+    refresh_prices: bool,
+    /// Price against every ninja category (adds gems and base types)
+    #[arg(long)]
+    all: bool,
+    /// Refresh prices when older than this many seconds
+    #[arg(long, default_value_t = 1800)]
+    price_interval: u64,
+    /// Override the endpoint (for tests/proxies)
+    #[arg(long)]
+    base_url: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum NinjaCommand {
+    /// Download economy overviews into the database
+    Fetch {
+        #[arg(long, env = "BIG_OIL_LEAGUE")]
+        league: String,
+        /// Comma-separated item-overview categories (overrides the default set)
+        #[arg(long)]
+        types: Option<String>,
+        /// Every category, including gems and base types
+        #[arg(long)]
+        all: bool,
+        /// Skip the currency-overview categories
+        #[arg(long)]
+        no_currency: bool,
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+}
+
 #[derive(clap::Args)]
 struct Search {
     #[arg(long)]
@@ -139,6 +211,9 @@ struct Search {
     /// Only items first seen within this window (e.g. 30m, 6h, 7d)
     #[arg(long)]
     since: Option<String>,
+    /// Only own-stash items or only stream listings (stream|own)
+    #[arg(long)]
+    source: Option<String>,
     /// Include sold/unlisted items
     #[arg(long)]
     include_delisted: bool,
@@ -173,6 +248,20 @@ fn run() -> Result<()> {
         Command::Item { id, json } => show_item(&cfg, &id, json),
         Command::History { id, json } => show_history(&cfg, &id, json),
         Command::Stats { json } => show_stats(&cfg, json),
+        Command::Stash { cmd } => match cmd {
+            StashCommand::Watch(args) => stash_watch(&cfg, args),
+            StashCommand::List => stash_list(&cfg),
+            StashCommand::Value { league } => stash_value(&cfg, &league),
+        },
+        Command::Ninja { cmd } => match cmd {
+            NinjaCommand::Fetch {
+                league,
+                types,
+                all,
+                no_currency,
+                base_url,
+            } => ninja_fetch_cmd(&cfg, &league, types, all, no_currency, base_url),
+        },
         Command::Paths => {
             for (name, path) in cfg.layout() {
                 println!("{name:<9} {path}");
@@ -377,6 +466,7 @@ fn search(cfg: &Config, args: Search) -> Result<()> {
         currency: args.currency,
         min_links: args.min_links,
         since,
+        source: args.source,
         include_delisted: args.include_delisted,
         limit: args.limit,
         offset: args.offset,
@@ -399,6 +489,7 @@ fn search(cfg: &Config, args: Search) -> Result<()> {
                 r.display_name(),
                 r.ilvl.map(|v| v.to_string()).unwrap_or_default(),
                 r.price().unwrap_or_else(|| "-".into()),
+                value_cell(r),
                 render::age(r.first_seen),
                 r.delisted_at
                     .map(|_| "delisted")
@@ -413,7 +504,7 @@ fn search(cfg: &Config, args: Search) -> Result<()> {
         "{}",
         render::table(
             &[
-                "league", "item", "ilvl", "price", "age", "status", "stash", "account"
+                "league", "item", "ilvl", "price", "value", "age", "status", "stash", "account",
             ],
             &table,
             34
@@ -428,12 +519,14 @@ fn show_item(cfg: &Config, id: &str, json: bool) -> Result<()> {
         bail!("no item with id {id}");
     };
     let history = store.history(id)?;
+    let valuations = store.valuations(id)?;
     let (mods_text, raw) = store.item_extra(id)?.unwrap_or_default();
 
     if json {
         let value = serde_json::json!({
             "item": item,
             "history": history,
+            "valuations": valuations,
             "mods": mods_text,
             "raw": serde_json::from_str::<serde_json::Value>(&raw).ok(),
         });
@@ -472,6 +565,13 @@ fn show_item(cfg: &Config, id: &str, json: bool) -> Result<()> {
             .map(|n| format!("note={n:?}"))
             .unwrap_or_default()
     );
+    if item.value_chaos.is_some() {
+        println!(
+            "  value     {} (poe.ninja, {})",
+            value_cell(&item),
+            item.valued_at.map(render::ts).unwrap_or_default()
+        );
+    }
     println!(
         "  seen      first {} ({}) | last {} ({}){}",
         render::ts(item.first_seen),
@@ -487,6 +587,20 @@ fn show_item(cfg: &Config, id: &str, json: bool) -> Result<()> {
         println!("  mods:");
         for line in mods_text.lines().filter(|l| !l.trim().is_empty()) {
             println!("    {line}");
+        }
+    }
+    if valuations.len() > 1 {
+        println!("  valuations:");
+        for v in &valuations {
+            println!(
+                "    {}  {} chaos{} ({})",
+                render::ts(v.at),
+                v.chaos.map(trim_num).unwrap_or_else(|| "?".into()),
+                v.divine
+                    .map(|d| format!(" / {} divine", trim_num(d)))
+                    .unwrap_or_default(),
+                v.matched.clone().unwrap_or_default()
+            );
         }
     }
     if !history.is_empty() {
@@ -603,5 +717,312 @@ fn show_stats(cfg: &Config, json: bool) -> Result<()> {
             render::table(&["league", "live items", "priced"], &rows, 32)
         );
     }
+    Ok(())
+}
+
+fn contact(cfg: &Config) -> String {
+    cfg.contact.clone().unwrap_or_else(|| "unset".to_string())
+}
+
+fn trim_num(v: f64) -> String {
+    if (v.fract()).abs() < f64::EPSILON {
+        format!("{}", v as i64)
+    } else if v.abs() >= 100.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+fn value_cell(row: &store::ItemRow) -> String {
+    match (row.value_chaos, row.value_divine) {
+        (Some(c), Some(d)) => format!("{}c / {}d", trim_num(c), trim_num(d)),
+        (Some(c), None) => format!("{}c", trim_num(c)),
+        _ => "-".into(),
+    }
+}
+
+fn parse_tab_filter(raw: &Option<String>) -> Option<Vec<i64>> {
+    raw.as_ref().map(|spec| {
+        spec.split(',')
+            .filter_map(|p| p.trim().parse::<i64>().ok())
+            .collect()
+    })
+}
+
+fn selected_types(all: bool) -> Vec<String> {
+    if all {
+        ninja::all_item_types()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        ninja::DEFAULT_ITEM_TYPES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect()
+    }
+}
+
+/// Download the economy overviews for one league. Returns (lines stored,
+/// categories changed).
+fn fetch_prices(
+    cfg: &Config,
+    store: &mut Store,
+    league: &str,
+    item_types: &[String],
+    include_currency: bool,
+    base_url: Option<String>,
+) -> Result<(usize, usize)> {
+    let client = NinjaClient::with_base(
+        base_url.unwrap_or_else(|| ninja::BASE.to_string()),
+        &contact(cfg),
+    );
+    let mut stored = 0usize;
+    let mut categories = 0usize;
+
+    for category in item_types {
+        let etag = store.price_etag(league, category)?;
+        match client.item_overview(league, category, etag.as_deref())? {
+            Overview::NotModified => tracing::debug!(category, "unchanged"),
+            Overview::Lines { lines, etag } => {
+                let n = store.upsert_price_lines(league, category, etag.as_deref(), &lines)?;
+                stored += n;
+                categories += 1;
+                tracing::debug!(category, lines = n, "stored");
+            }
+        }
+    }
+
+    if include_currency {
+        for category in ninja::POE1_CURRENCY_TYPES {
+            let etag = store.price_etag(league, category)?;
+            match client.currency_overview(league, category, etag.as_deref())? {
+                Overview::NotModified => {}
+                Overview::Lines { lines, etag } => {
+                    let n = store.upsert_price_lines(league, category, etag.as_deref(), &lines)?;
+                    stored += n;
+                    categories += 1;
+                    tracing::debug!(category, lines = n, "stored");
+                }
+            }
+        }
+    }
+
+    Ok((stored, categories))
+}
+
+fn ninja_fetch_cmd(
+    cfg: &Config,
+    league: &str,
+    types: Option<String>,
+    all: bool,
+    no_currency: bool,
+    base_url: Option<String>,
+) -> Result<()> {
+    let mut store = open_store(cfg)?;
+    let item_types: Vec<String> = match types {
+        Some(spec) => spec
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        None => selected_types(all),
+    };
+    let (stored, categories) =
+        fetch_prices(cfg, &mut store, league, &item_types, !no_currency, base_url)?;
+    println!("{league}: {stored} price lines across {categories} changed categories");
+    Ok(())
+}
+
+fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
+    let cookie = cfg.poesessid.clone().with_context(|| {
+        "no POESESSID configured.\n\
+         The stash endpoints are the website's own, so they need a logged-in session:\n\
+         pathofexile.com -> DevTools -> Application -> Cookies -> copy POESESSID,\n\
+         then set BIG_OIL_POESESSID or put \"poesessid\" in the config file."
+    })?;
+    let account = cfg.account.clone().with_context(|| {
+        "no account configured: set BIG_OIL_ACCOUNT or \"account\" in the config file (Name#1234)"
+    })?;
+
+    let mut store = open_store(cfg)?;
+    let client = OwnClient::with_base(
+        args.base_url
+            .clone()
+            .unwrap_or_else(|| big_oil::own::BASE.to_string()),
+        cookie,
+        &contact(cfg),
+    );
+    let filter = parse_tab_filter(&args.tabs);
+    let item_types = selected_types(args.all);
+    let mut first = true;
+
+    loop {
+        let stale = match store.priced_at(&args.league)? {
+            Some(at) => store::unix_now() - at >= args.price_interval as i64,
+            None => true,
+        };
+        if (first && args.refresh_prices) || stale {
+            match fetch_prices(
+                cfg,
+                &mut store,
+                &args.league,
+                &item_types,
+                true,
+                args.base_url.clone(),
+            ) {
+                Ok((lines, categories)) => {
+                    tracing::info!(lines, categories, "price snapshot refreshed")
+                }
+                Err(e) => tracing::warn!(error = %e, "price refresh failed; using stored snapshot"),
+            }
+        }
+
+        match stash_pass(&mut store, &client, &account, &args, filter.as_deref()) {
+            Ok(drops) => print_drops(&drops),
+            Err(e) if args.once => return Err(e),
+            Err(e) => tracing::warn!(error = %e, interval = args.interval, "pass failed"),
+        }
+
+        first = false;
+        if args.once {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(args.interval));
+    }
+}
+
+fn stash_pass(
+    store: &mut Store,
+    client: &OwnClient,
+    account: &str,
+    args: &StashWatch,
+    filter: Option<&[i64]>,
+) -> Result<Vec<store::ItemRow>> {
+    let started = store::unix_now();
+    let tabs = client.tabs(account, &args.league)?;
+    let mut scanned = 0usize;
+
+    for tab in &tabs.tabs {
+        if tab.hidden {
+            continue;
+        }
+        if let Some(filter) = filter
+            && !filter.contains(&tab.index)
+        {
+            continue;
+        }
+        let items = client.tab(account, &args.league, tab.index)?;
+        let stats = store.ingest_own_tab(
+            &tab.stash_id(&args.league),
+            &tab.name,
+            &tab.kind,
+            &args.league,
+            Some(account),
+            &items,
+        )?;
+        scanned += 1;
+        if stats.items_new > 0 || stats.delisted > 0 {
+            tracing::info!(
+                tab = %tab.name,
+                dropped = stats.items_new,
+                removed = stats.delisted,
+                "tab changed"
+            );
+        }
+    }
+
+    let valued = store.value_items(&args.league)?;
+    let drops = store.search(&SearchQuery {
+        source: Some("own".into()),
+        since: Some(started),
+        order: Order::Newest,
+        limit: 100,
+        ..Default::default()
+    })?;
+    tracing::info!(
+        tabs = scanned,
+        total_tabs = tabs.tabs.len(),
+        valued,
+        new = drops.len(),
+        "pass complete"
+    );
+    Ok(drops)
+}
+
+fn print_drops(rows: &[store::ItemRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("new items:");
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.display_name(),
+                r.stash_name.clone().unwrap_or_default(),
+                r.ilvl.map(|v| v.to_string()).unwrap_or_default(),
+                value_cell(r),
+                render::age(r.first_seen),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render::table(&["item", "tab", "ilvl", "value", "age"], &body, 44)
+    );
+}
+
+fn stash_list(cfg: &Config) -> Result<()> {
+    let store = open_store(cfg)?;
+    let tabs = store.own_tabs()?;
+    if tabs.is_empty() {
+        println!("no own tabs scanned yet: big_oil stash watch --league <league>");
+        return Ok(());
+    }
+    let body: Vec<Vec<String>> = tabs
+        .iter()
+        .map(|t| {
+            vec![
+                t.name.clone(),
+                t.league.clone(),
+                t.items.to_string(),
+                t.live.to_string(),
+                trim_num(t.value_chaos),
+                trim_num(t.value_divine),
+                t.last_seen.map(render::age).unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render::table(
+            &[
+                "tab", "league", "items", "live", "chaos", "divine", "scanned"
+            ],
+            &body,
+            40
+        )
+    );
+    let chaos: f64 = tabs.iter().map(|t| t.value_chaos).sum();
+    let divine: f64 = tabs.iter().map(|t| t.value_divine).sum();
+    println!(
+        "total: {} chaos / {} divine across {} tabs",
+        trim_num(chaos),
+        trim_num(divine),
+        tabs.len()
+    );
+    Ok(())
+}
+
+fn stash_value(cfg: &Config, league: &str) -> Result<()> {
+    let mut store = open_store(cfg)?;
+    if store.price_lines(league)?.is_empty() {
+        bail!("no price snapshot for {league}: run `big_oil ninja fetch --league {league}` first");
+    }
+    let n = store.value_items(league)?;
+    println!("valued {n} own items in {league}");
     Ok(())
 }

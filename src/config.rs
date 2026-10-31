@@ -12,6 +12,10 @@ use std::path::PathBuf;
 pub struct ConfigFile {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    /// Full-account session cookie for reading your own stash tabs.
+    pub poesessid: Option<String>,
+    /// Account name (`Name#1234`) used for own-stash reads.
+    pub account: Option<String>,
     /// Contact string for the required `User-Agent: OAuth <id>/<ver> (contact: ...)`.
     pub contact: Option<String>,
     pub db_path: Option<PathBuf>,
@@ -22,6 +26,8 @@ pub struct ConfigFile {
 pub struct Config {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    pub poesessid: Option<String>,
+    pub account: Option<String>,
     pub contact: Option<String>,
     pub db_path: PathBuf,
     pub interval_secs: u64,
@@ -53,6 +59,8 @@ impl Config {
         Ok(Config {
             client_id: env("BIG_OIL_CLIENT_ID").or(file.client_id),
             client_secret: env("BIG_OIL_CLIENT_SECRET").or(file.client_secret),
+            poesessid: env("BIG_OIL_POESESSID").or(file.poesessid),
+            account: env("BIG_OIL_ACCOUNT").or(file.account),
             contact: env("BIG_OIL_CONTACT").or(file.contact),
             db_path,
             interval_secs,

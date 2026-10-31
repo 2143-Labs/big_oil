@@ -67,6 +67,9 @@ pub struct Item {
     pub links: Option<i64>,
     pub corrupted: bool,
     pub identified: Option<bool>,
+    pub gem_level: Option<i64>,
+    pub gem_quality: Option<i64>,
+    pub map_tier: Option<i64>,
     pub icon: Option<String>,
     /// Free text the seller typed; price notes (`~b/o 1 divine`) live here.
     pub note: Option<String>,
@@ -139,6 +142,9 @@ impl Item {
             links,
             corrupted: bool_field(v, "corrupted").unwrap_or(false),
             identified: bool_field(v, "identified"),
+            gem_level: property_number(v, "Level"),
+            gem_quality: property_number(v, "Quality"),
+            map_tier: property_number(v, "Map Tier"),
             icon: str_field(v, "icon"),
             note: str_field(v, "note"),
             mods_text: mods.join("\n"),
@@ -151,6 +157,33 @@ impl Item {
     pub fn is_trackable(&self) -> bool {
         !self.id.is_empty()
     }
+}
+
+/// Pull a numeric value out of the rendered `properties` block, which is where
+/// gem level/quality and map tier live (`{"name":"Level","values":[["20",0]]}`).
+fn property_number(v: &Value, key: &str) -> Option<i64> {
+    v.get("properties")?
+        .as_array()?
+        .iter()
+        .find(|p| {
+            p.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.eq_ignore_ascii_case(key))
+        })?
+        .get("values")?
+        .get(0)?
+        .get(0)?
+        .as_str()
+        .map(|raw| {
+            raw.trim()
+                .trim_start_matches('+')
+                .split('%')
+                .next()
+                .unwrap_or(raw)
+                .trim()
+                .parse::<i64>()
+                .ok()
+        })?
 }
 
 /// `sockets` is `[{group, attr, sColour}, ...]`; `links` is the largest group.
@@ -257,6 +290,26 @@ mod tests {
         let item = Item::from_value(&v);
         assert!(item.mods_text.contains("Socketed Minion Gems"));
         assert!(item.mods_text.contains("Fire Resistance"));
+    }
+
+    #[test]
+    fn reads_gem_and_map_properties() {
+        let gem = json!({
+            "id": "g",
+            "properties": [
+                {"name": "Level", "values": [["20", 0]]},
+                {"name": "Quality", "values": [["+23%", 1]]}
+            ]
+        });
+        let item = Item::from_value(&gem);
+        assert_eq!(item.gem_level, Some(20));
+        assert_eq!(item.gem_quality, Some(23));
+
+        let map = json!({
+            "id": "m",
+            "properties": [{"name": "Map Tier", "values": [["16", 0]]}]
+        });
+        assert_eq!(Item::from_value(&map).map_tier, Some(16));
     }
 
     #[test]

@@ -1,9 +1,13 @@
 # big_oil
 
-Path of Exile public stash market listener. It polls GGG's Public Stash API
-(`GET /public-stash-tabs`), keeps every stash and item it sees in SQLite, and
-derives a listing history (listed / price changed / relisted / delisted) that you
-can query offline.
+Path of Exile market index. Two feeds share one SQLite database:
+
+- **public stash stream** — GGG's `GET /public-stash-tabs`, every stash and item,
+  with a listing history (listed / price changed / relisted / delisted);
+- **your own tabs** — the website's `character-window/get-stash-items`, diffed so
+  you can see what you just dropped in, valued against poe.ninja economy data.
+
+It all stays offline-queryable.
 
 ```sh
 big_oil watch                 # long-running listener, resumes from its cursor
@@ -61,6 +65,54 @@ big_oil auth --force    # re-mint after revoking/rotating the secret
 Client-credentials tokens have no expiry; the cached token is reused until the
 API rejects it, at which point `watch` refreshes it once automatically.
 
+## Your own tab (auto-priced drops)
+
+```sh
+big_oil ninja fetch --league Allflame          # economy snapshot (no auth)
+big_oil stash watch --league Allflame          # poll tabs, record + price drops
+big_oil stash list                             # per-tab item counts and value
+big_oil search --source own --limit 20         # your items, with a VALUE column
+```
+
+`stash watch` reads the tab list once, then each visible tab, diffs item ids
+against what it recorded (`dropped` / `removed` events), and attaches a
+poe.ninja estimate. New items are printed as they appear, so leaving it running
+next to the game gives you a priced drop feed.
+
+Credentials, only needed for this feature:
+
+| key         | env                  |
+| ----------- | -------------------- |
+| `poesessid` | `BIG_OIL_POESESSID`  |
+| `account`   | `BIG_OIL_ACCOUNT` (`Name#1234`) |
+
+Copy `POESESSID` from a logged-in pathofexile.com tab (DevTools → Application →
+Cookies). It is a **full account session**: big_oil sends it only to
+pathofexile.com, never logs it, and stores it nowhere except where you put it.
+It expires — when passes start failing with 403, copy a fresh one. Note that
+this endpoint is the website's own and is not part of GGG's documented API
+(their guidelines say not to reverse-engineer endpoints outside the docs); the
+documented `account:stashes` alternative needs a registered OAuth app, which is
+the same frozen-registration wall as the stream.
+
+### What can be priced
+
+poe.ninja prices item *types*, not listings. Covered: uniques (weapon, armour,
+accessory, flask, jewel, relic, tincture), gems (with `--all`), cluster jewels,
+maps, base types (with `--all`), currency, fragments, essences, oils, fossil,
+scarabs, tattoos, omens and the rest of the currency categories. **Rare armour,
+weapons and jewels are not priced anywhere** — they have no per-item data, so
+they show `-`.
+
+Matching is name → base type, then corruption, links, gem level/quality and map
+tier. When a unique has several variants the item JSON cannot distinguish (e.g.
+Mageblood's flask effects), the most widely listed variant wins.
+
+Refresh: poe.ninja serves `cache-control: max-age=1800` and an ETag, and its PoE 1
+data updates roughly every 15 minutes, so `stash watch` refreshes every
+`--price-interval` seconds (default 1800) using conditional requests. The default
+category set is ~3 MB; `--all` adds gems and base types (~6 MB more).
+
 ## Build
 
 ```sh
@@ -82,12 +134,14 @@ item       One item, its mods and listing history (--json)
 history    Just the listing events for an item (--json)
 stats      Index summary (--json)
 paths      Config, token and database locations
+stash      watch | list | value   (your own tabs)
+ninja      fetch                  (poe.ninja economy snapshot)
 ```
 
 Search filters: `--league --name --base --rarity --account --mods --min-ilvl
---max-ilvl --min-price --max-price --currency --min-links --since 6h
---include-delisted --limit --offset --order newest|oldest|price-asc|price-desc|ilvl-desc
---json`.
+--max-ilvl --min-price --max-price --currency --min-links --since 6h --source
+stream|own --include-delisted --limit --offset --order
+newest|oldest|price-asc|price-desc|ilvl-desc --json`.
 
 `--mods` runs a full-text (FTS5) match over implicit/explicit/enchant/crafted/
 fractured/utility mod lines.
@@ -101,8 +155,14 @@ fractured/utility mod lines.
 | `meta`     | `next_change_id` cursor, page counter, first/last poll |
 | `stashes`  | one row per stash tab: account, name, type, league, public, seen window |
 | `items`    | one row per item id: name/base/type/rarity/ilvl/sockets/links, price, mods text, first/last seen, delisted_at, exact JSON in `raw` |
-| `listings` | event log: `listed`, `price_changed`, `relisted`, `delisted` |
+| `listings` | event log: `listed`/`dropped`, `price_changed`, `relisted`/`restored`, `delisted`/`removed` |
 | `items_fts`| FTS5 index over name/type/base/mods |
+| `price_ref`| latest poe.ninja economy lines per league/category |
+| `price_snapshots` | ETag + line count per fetched category |
+| `valuations` | every estimate ever attached to an item |
+
+`stashes.source` and `items.source` say where a row came from (`stream` or
+`own`); everything else works the same for both.
 
 Because the stream only sends tabs that changed — and each change carries that
 tab's full contents — a page is diffed against the last snapshot of each stash:

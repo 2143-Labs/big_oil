@@ -1,9 +1,10 @@
 //! SQLite persistence: the stash/item index plus the listing event log.
 //!
-//! The stream only sends stashes that *changed*, and each change carries the
-//! full current contents of that stash. That lets us diff a stash against what
-//! we recorded and derive listing events: `listed`, `price_changed`,
-//! `relisted`, `delisted`, `stash_unlisted`.
+//! Two sources share the tables. `stream` is the public stash firehose
+//! (`listed` / `price_changed` / `relisted` / `delisted` / `stash_unlisted`);
+//! `own` is the account's own tabs (`dropped` / `price_changed` / `restored` /
+//! `removed`). Either way the stream only sends tabs that changed with their
+//! full contents, so successive snapshots are diffed.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -12,9 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::model::Stash;
+use crate::ninja::{self, ItemView, PriceLine};
 use crate::price::{self, Price};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS stashes (
     stash_type  TEXT,
     league      TEXT,
     public      INTEGER NOT NULL DEFAULT 1,
+    source      TEXT NOT NULL DEFAULT 'stream',
     first_seen  INTEGER NOT NULL,
     last_seen   INTEGER NOT NULL,
     delisted_at INTEGER
@@ -57,6 +60,13 @@ CREATE TABLE IF NOT EXISTS items (
     price_currency TEXT,
     price_type     TEXT,
     mods_text      TEXT,
+    gem_level      INTEGER,
+    gem_quality    INTEGER,
+    map_tier       INTEGER,
+    source         TEXT NOT NULL DEFAULT 'stream',
+    value_chaos    REAL,
+    value_divine   REAL,
+    valued_at      INTEGER,
     first_seen     INTEGER NOT NULL,
     last_seen      INTEGER NOT NULL,
     delisted_at    INTEGER,
@@ -84,6 +94,49 @@ CREATE TABLE IF NOT EXISTS listings (
 );
 CREATE INDEX IF NOT EXISTS listings_item ON listings(item_id, at);
 CREATE INDEX IF NOT EXISTS listings_time ON listings(at);
+
+-- Latest poe.ninja economy overview lines, one row per priced variant.
+CREATE TABLE IF NOT EXISTS price_ref (
+    seq           INTEGER PRIMARY KEY,
+    league        TEXT NOT NULL,
+    category      TEXT NOT NULL,
+    name          TEXT,
+    base_type     TEXT,
+    variant       TEXT,
+    links         INTEGER,
+    corrupted     INTEGER,
+    gem_level     INTEGER,
+    gem_quality   INTEGER,
+    map_tier      INTEGER,
+    chaos         REAL,
+    divine        REAL,
+    listing_count INTEGER,
+    details_id     TEXT,
+    fetched_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS price_ref_lookup ON price_ref(league, name);
+CREATE INDEX IF NOT EXISTS price_ref_cat    ON price_ref(league, category);
+
+CREATE TABLE IF NOT EXISTS price_snapshots (
+    league     TEXT NOT NULL,
+    category   TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    etag       TEXT,
+    line_count INTEGER NOT NULL,
+    PRIMARY KEY (league, category, fetched_at)
+);
+
+-- History of the estimates attached to individual items.
+CREATE TABLE IF NOT EXISTS valuations (
+    seq           INTEGER PRIMARY KEY,
+    item_id       TEXT NOT NULL,
+    at            INTEGER NOT NULL,
+    chaos         REAL,
+    divine        REAL,
+    matched       TEXT,
+    listing_count INTEGER
+);
+CREATE INDEX IF NOT EXISTS valuations_item ON valuations(item_id, at);
 "#;
 
 const FTS_SCHEMA: &str = r#"
@@ -109,6 +162,46 @@ END;
 
 pub fn unix_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Where a snapshot came from, which decides the event vocabulary written to
+/// `listings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The public stash stream: items are listed for sale.
+    Market,
+    /// The account's own tabs: items appear and disappear as you move them.
+    Own,
+}
+
+impl Origin {
+    fn source(self) -> &'static str {
+        match self {
+            Origin::Market => "stream",
+            Origin::Own => "own",
+        }
+    }
+
+    fn listed(self) -> &'static str {
+        match self {
+            Origin::Market => "listed",
+            Origin::Own => "dropped",
+        }
+    }
+
+    fn delisted(self) -> &'static str {
+        match self {
+            Origin::Market => "delisted",
+            Origin::Own => "removed",
+        }
+    }
+
+    fn relisted(self) -> &'static str {
+        match self {
+            Origin::Market => "relisted",
+            Origin::Own => "restored",
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +234,10 @@ pub struct ItemRow {
     pub price_amount: Option<f64>,
     pub price_currency: Option<String>,
     pub price_type: Option<String>,
+    pub source: String,
+    pub value_chaos: Option<f64>,
+    pub value_divine: Option<f64>,
+    pub valued_at: Option<i64>,
     pub first_seen: i64,
     pub last_seen: i64,
     pub delisted_at: Option<i64>,
@@ -170,6 +267,27 @@ fn trim_num(v: f64) -> String {
     } else {
         format!("{v}")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Valuation {
+    pub at: i64,
+    pub chaos: Option<f64>,
+    pub divine: Option<f64>,
+    pub matched: Option<String>,
+    pub listing_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OwnTabRow {
+    pub stash_id: String,
+    pub name: String,
+    pub league: String,
+    pub items: i64,
+    pub live: i64,
+    pub value_chaos: f64,
+    pub value_divine: f64,
+    pub last_seen: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -207,6 +325,8 @@ pub struct SearchQuery {
     pub currency: Option<String>,
     pub min_links: Option<i64>,
     pub since: Option<i64>,
+    /// `stream` (public listings) or `own` (your stash tabs).
+    pub source: Option<String>,
     pub include_delisted: bool,
     pub limit: usize,
     pub offset: usize,
@@ -229,6 +349,7 @@ impl Default for SearchQuery {
             currency: None,
             min_links: None,
             since: None,
+            source: None,
             include_delisted: false,
             limit: 25,
             offset: 0,
@@ -285,6 +406,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         // FTS5 ships with the bundled SQLite; if a system build lacks it we
         // still work, just with substring matching on mods_text.
         let fts = conn.execute_batch(FTS_SCHEMA).is_ok();
@@ -341,7 +463,7 @@ impl Store {
 
         for change in &page.stashes {
             let stash = change.clone().into_stash();
-            ingest_stash(&tx, &stash, &change_id, now, &mut stats)?;
+            ingest_stash(&tx, &stash, Origin::Market, &change_id, now, &mut stats)?;
         }
 
         if advance_cursor {
@@ -457,6 +579,10 @@ impl Store {
             clauses.push("i.first_seen >= ?".into());
             args.push(v.into());
         }
+        if let Some(v) = &q.source {
+            clauses.push("i.source = ?".into());
+            args.push(v.clone().into());
+        }
 
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
@@ -491,6 +617,254 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    /// Ingest one of the account's own tabs. Same diff as the public stream,
+    /// different vocabulary: items are `dropped`, disappear as `removed`.
+    pub fn ingest_own_tab(
+        &mut self,
+        stash_id: &str,
+        name: &str,
+        stash_type: &str,
+        league: &str,
+        account: Option<&str>,
+        items: &[crate::model::Item],
+    ) -> Result<IngestStats> {
+        let now = unix_now();
+        let stash = Stash {
+            id: stash_id.to_owned(),
+            public: true,
+            account: account.map(str::to_owned),
+            name: Some(name.to_owned()),
+            stash_type: Some(stash_type.to_owned()),
+            league: Some(league.to_owned()),
+            items: items.to_vec(),
+        };
+        let tx = self.conn.transaction()?;
+        let mut stats = IngestStats::default();
+        ingest_stash(&tx, &stash, Origin::Own, "", now, &mut stats)?;
+        tx.commit()?;
+        Ok(stats)
+    }
+
+    /// Replace the stored economy lines for `(league, category)`.
+    pub fn upsert_price_lines(
+        &mut self,
+        league: &str,
+        category: &str,
+        etag: Option<&str>,
+        lines: &[PriceLine],
+    ) -> Result<usize> {
+        let fetched_at = lines.first().map(|l| l.fetched_at).unwrap_or_else(unix_now);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM price_ref WHERE league = ?1 AND category = ?2",
+            params![league, category],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO price_ref(league, category, name, base_type, variant, links,
+                    corrupted, gem_level, gem_quality, map_tier, chaos, divine, listing_count,
+                    details_id, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            )?;
+            for line in lines {
+                stmt.execute(params![
+                    line.league,
+                    line.category,
+                    line.name,
+                    line.base_type,
+                    line.variant,
+                    line.links,
+                    line.corrupted.map(|b| b as i64),
+                    line.gem_level,
+                    line.gem_quality,
+                    line.map_tier,
+                    line.chaos,
+                    line.divine,
+                    line.listing_count,
+                    line.details_id,
+                    line.fetched_at,
+                ])?;
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO price_snapshots(league, category, fetched_at, etag, line_count)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![league, category, fetched_at, etag, lines.len() as i64],
+        )?;
+        tx.commit()?;
+        Ok(lines.len())
+    }
+
+    pub fn price_lines(&self, league: &str) -> Result<Vec<PriceLine>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT league, category, name, base_type, variant, links, corrupted, gem_level,
+                    gem_quality, map_tier, chaos, divine, listing_count, details_id, fetched_at
+             FROM price_ref WHERE league = ?1",
+        )?;
+        let rows = stmt
+            .query_map([league], |r| {
+                Ok(PriceLine {
+                    league: r.get(0)?,
+                    category: r.get(1)?,
+                    name: r.get(2)?,
+                    base_type: r.get(3)?,
+                    variant: r.get(4)?,
+                    links: r.get(5)?,
+                    corrupted: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                    gem_level: r.get(7)?,
+                    gem_quality: r.get(8)?,
+                    map_tier: r.get(9)?,
+                    chaos: r.get(10)?,
+                    divine: r.get(11)?,
+                    listing_count: r.get(12)?,
+                    details_id: r.get(13)?,
+                    fetched_at: r.get(14)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// ETag of the most recent stored snapshot for `(league, category)`.
+    pub fn price_etag(&self, league: &str, category: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT etag FROM price_snapshots WHERE league = ?1 AND category = ?2
+                 ORDER BY fetched_at DESC LIMIT 1",
+                params![league, category],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn priced_at(&self, league: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT MAX(fetched_at) FROM price_ref WHERE league = ?1",
+                [league],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Attach a market value to every live own-tab item that has a match.
+    pub fn value_items(&mut self, league: &str) -> Result<usize> {
+        let lines = self.price_lines(league)?;
+        if lines.is_empty() {
+            return Ok(0);
+        }
+        let now = unix_now();
+        let targets = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, name, type_line, base_type, frame_type, corrupted, links,
+                        gem_level, gem_quality, map_tier
+                 FROM items WHERE source = 'own' AND league = ?1 AND delisted_at IS NULL",
+            )?;
+            let rows: Vec<(String, ItemView)> = stmt
+                .query_map([league], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        ItemView {
+                            name: r.get(1)?,
+                            type_line: r.get(2)?,
+                            base_type: r.get(3)?,
+                            frame_type: r.get(4)?,
+                            corrupted: r.get::<_, i64>(5)? != 0,
+                            links: r.get(6)?,
+                            gem_level: r.get(7)?,
+                            gem_quality: r.get(8)?,
+                            map_tier: r.get(9)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        let tx = self.conn.transaction()?;
+        let mut valued = 0usize;
+        for (id, view) in targets {
+            let Some(line) = ninja::lookup(&lines, &view) else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE items SET value_chaos = ?2, value_divine = ?3, valued_at = ?4 WHERE id = ?1",
+                params![id, line.chaos, line.divine, now],
+            )?;
+            let matched = format!(
+                "{}:{}",
+                line.category,
+                line.name.clone().unwrap_or_else(|| "?".into())
+            );
+            tx.execute(
+                "INSERT INTO valuations(item_id, at, chaos, divine, matched, listing_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    now,
+                    line.chaos,
+                    line.divine,
+                    matched,
+                    line.listing_count
+                ],
+            )?;
+            valued += 1;
+        }
+        tx.commit()?;
+        Ok(valued)
+    }
+
+    pub fn valuations(&self, item_id: &str) -> Result<Vec<Valuation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT at, chaos, divine, matched, listing_count FROM valuations
+             WHERE item_id = ?1 ORDER BY at ASC, seq ASC",
+        )?;
+        let rows = stmt
+            .query_map([item_id], |r| {
+                Ok(Valuation {
+                    at: r.get(0)?,
+                    chaos: r.get(1)?,
+                    divine: r.get(2)?,
+                    matched: r.get(3)?,
+                    listing_count: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn own_tabs(&self) -> Result<Vec<OwnTabRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, COALESCE(s.name, '?'), COALESCE(s.league, '?'),
+                    COUNT(i.id),
+                    SUM(CASE WHEN i.delisted_at IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN i.delisted_at IS NULL THEN COALESCE(i.value_chaos, 0) ELSE 0 END),
+                    SUM(CASE WHEN i.delisted_at IS NULL THEN COALESCE(i.value_divine, 0) ELSE 0 END),
+                    MAX(s.last_seen)
+             FROM stashes s LEFT JOIN items i ON i.stash_id = s.id
+             WHERE s.source = 'own'
+             GROUP BY s.id ORDER BY 1",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(OwnTabRow {
+                    stash_id: r.get(0)?,
+                    name: r.get(1)?,
+                    league: r.get(2)?,
+                    items: r.get(3)?,
+                    live: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    value_chaos: r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    value_divine: r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                    last_seen: r.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn item(&self, id: &str) -> Result<Option<ItemRow>> {
@@ -564,7 +938,8 @@ impl Store {
 const ITEM_SELECT: &str =
     "SELECT i.id, i.stash_id, s.name, i.account, i.league, i.name, i.type_line,
         i.base_type, i.rarity, i.ilvl, i.stack_size, i.sockets, i.links, i.corrupted, i.note,
-        i.price_amount, i.price_currency, i.price_type, i.first_seen, i.last_seen, i.delisted_at
+        i.price_amount, i.price_currency, i.price_type, i.source, i.value_chaos, i.value_divine,
+        i.valued_at, i.first_seen, i.last_seen, i.delisted_at
     FROM items i LEFT JOIN stashes s ON s.id = i.stash_id";
 
 fn item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
@@ -587,9 +962,13 @@ fn item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
         price_amount: r.get(15)?,
         price_currency: r.get(16)?,
         price_type: r.get(17)?,
-        first_seen: r.get(18)?,
-        last_seen: r.get(19)?,
-        delisted_at: r.get(20)?,
+        source: r.get(18)?,
+        value_chaos: r.get(19)?,
+        value_divine: r.get(20)?,
+        valued_at: r.get(21)?,
+        first_seen: r.get(22)?,
+        last_seen: r.get(23)?,
+        delisted_at: r.get(24)?,
     })
 }
 
@@ -613,6 +992,7 @@ struct ExistingItem {
 fn ingest_stash(
     tx: &Transaction<'_>,
     stash: &Stash,
+    origin: Origin,
     change_id: &str,
     now: i64,
     stats: &mut IngestStats,
@@ -620,8 +1000,8 @@ fn ingest_stash(
     stats.stashes += 1;
 
     tx.execute(
-        "INSERT INTO stashes(id, account, name, stash_type, league, public, first_seen, last_seen, delisted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL)
+        "INSERT INTO stashes(id, account, name, stash_type, league, public, source, first_seen, last_seen, delisted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, ?7, ?7, NULL)
          ON CONFLICT(id) DO UPDATE SET
              account    = COALESCE(excluded.account, stashes.account),
              name       = COALESCE(excluded.name, stashes.name),
@@ -636,7 +1016,8 @@ fn ingest_stash(
             stash.stash_type,
             stash.league,
             stash.public as i64,
-            now
+            now,
+            origin.source()
         ],
     )?;
 
@@ -667,7 +1048,7 @@ fn ingest_stash(
             params![stash.id, now],
         )?;
         for item_id in open_items.keys() {
-            close_item(tx, item_id, &stash.id, stash, change_id, now)?;
+            close_item(tx, item_id, &stash.id, stash, origin, change_id, now)?;
             stats.delisted += 1;
         }
         stats.unlisted_stashes += 1;
@@ -700,7 +1081,16 @@ fn ingest_stash(
             None => select_item(tx, &item.id)?,
         };
 
-        upsert_item(tx, item, stash, amount, currency, kind, now)?;
+        upsert_item(
+            tx,
+            item,
+            stash,
+            amount,
+            currency,
+            kind,
+            origin.source(),
+            now,
+        )?;
         stats.items_new += usize::from(previous.is_none());
 
         match &previous {
@@ -708,7 +1098,7 @@ fn ingest_stash(
                 tx,
                 item.id.as_str(),
                 stash,
-                "listed",
+                origin.listed(),
                 &parsed,
                 None,
                 change_id,
@@ -721,7 +1111,7 @@ fn ingest_stash(
                         tx,
                         item.id.as_str(),
                         stash,
-                        "relisted",
+                        origin.relisted(),
                         &parsed,
                         None,
                         change_id,
@@ -749,7 +1139,7 @@ fn ingest_stash(
     // contain was removed or sold.
     for (item_id, prev) in &open_items {
         if !incoming.contains(item_id.as_str()) {
-            close_item(tx, item_id, &stash.id, stash, change_id, now)?;
+            close_item(tx, item_id, &stash.id, stash, origin, change_id, now)?;
             let _ = prev;
             stats.delisted += 1;
         }
@@ -796,15 +1186,17 @@ fn upsert_item(
     amount: Option<f64>,
     currency: Option<&str>,
     kind: Option<&str>,
+    source: &str,
     now: i64,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO items(
             id, stash_id, league, account, name, type_line, base_type, rarity, frame_type, ilvl,
             stack_size, sockets, links, corrupted, identified, icon, note, price_amount,
-            price_currency, price_type, mods_text, first_seen, last_seen, delisted_at, raw)
+            price_currency, price_type, mods_text, gem_level, gem_quality, map_tier, source,
+            first_seen, last_seen, delisted_at, raw)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22, ?22, NULL, ?23)
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?26, NULL, ?27)
          ON CONFLICT(id) DO UPDATE SET
             stash_id       = excluded.stash_id,
             league         = COALESCE(excluded.league, items.league),
@@ -826,6 +1218,10 @@ fn upsert_item(
             price_currency = excluded.price_currency,
             price_type     = excluded.price_type,
             mods_text      = excluded.mods_text,
+            gem_level      = excluded.gem_level,
+            gem_quality    = excluded.gem_quality,
+            map_tier       = excluded.map_tier,
+            source         = excluded.source,
             last_seen      = excluded.last_seen,
             delisted_at    = NULL,
             raw            = excluded.raw",
@@ -851,6 +1247,10 @@ fn upsert_item(
             currency,
             kind,
             item.mods_text,
+            item.gem_level,
+            item.gem_quality,
+            item.map_tier,
+            source,
             now,
             item.raw,
         ],
@@ -863,6 +1263,7 @@ fn close_item(
     item_id: &str,
     stash_id: &str,
     stash: &Stash,
+    origin: Origin,
     change_id: &str,
     now: i64,
 ) -> Result<()> {
@@ -886,7 +1287,16 @@ fn close_item(
                 currency: c?,
             })
         });
-        insert_event(tx, item_id, stash, "delisted", &old, None, change_id, now)?;
+        insert_event(
+            tx,
+            item_id,
+            stash,
+            origin.delisted(),
+            &old,
+            None,
+            change_id,
+            now,
+        )?;
         let _ = stash_id;
     }
     Ok(())
@@ -921,5 +1331,40 @@ fn insert_event(
             change_id,
         ],
     )?;
+    Ok(())
+}
+
+/// Bring databases created before schema v2 up to date. `CREATE TABLE IF NOT
+/// EXISTS` handles new tables; columns need explicit checks.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+
+    for (table, column, decl) in [
+        ("stashes", "source", "TEXT NOT NULL DEFAULT 'stream'"),
+        ("items", "source", "TEXT NOT NULL DEFAULT 'stream'"),
+        ("items", "value_chaos", "REAL"),
+        ("items", "value_divine", "REAL"),
+        ("items", "valued_at", "INTEGER"),
+        ("items", "gem_level", "INTEGER"),
+        ("items", "gem_quality", "INTEGER"),
+        ("items", "map_tier", "INTEGER"),
+    ] {
+        if !has_column(table, column)? {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
