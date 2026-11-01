@@ -212,6 +212,10 @@ struct DumpArgs {
     /// Cut size in percent
     #[arg(long, default_value_t = 20.0)]
     cut: f64,
+    /// Step down by a fixed amount in the tab's own currency (queue-method
+    /// ladders, e.g. --step 10 for 50c -> 40c); overrides --cut
+    #[arg(long)]
+    step: Option<f64>,
     #[arg(long)]
     json: bool,
     /// Desktop notification with the summary
@@ -1088,6 +1092,7 @@ fn dump_settings(args: &DumpArgs) -> Result<DumpSettings> {
         min_loss_chaos: args.min_loss.max(0.0),
         cut_after_secs,
         cut_pct: args.cut.clamp(0.0, 95.0),
+        cut_abs: args.step.filter(|s| *s > 0.0),
     })
 }
 
@@ -1128,10 +1133,65 @@ fn run_dump(cfg: &Config, args: DumpArgs) -> Result<()> {
     Ok(())
 }
 
+/// Rows shown per section before summarising the rest.
+const REPORT_ROWS: usize = 20;
+
 fn print_report(report: &dump::Report, settings: &DumpSettings) {
     if report.is_quiet() {
-        println!("nothing to do: no underpriced or stale listings");
+        println!("nothing to do: no underpriced items and no tab is due a cut");
         return;
+    }
+
+    // Tabs first: a dump tab is priced and stepped down as a unit.
+    if !report.tabs.is_empty() {
+        println!("TABS");
+        let body: Vec<Vec<String>> = report
+            .tabs
+            .iter()
+            .map(|t| {
+                let at = match (&t.price, t.priced == 0) {
+                    (Some(price), _) => price.clone(),
+                    (None, true) => "unpriced".to_string(),
+                    _ => "mixed".to_string(),
+                };
+                vec![
+                    t.name.clone(),
+                    t.items.to_string(),
+                    if t.unpriced > 0 {
+                        t.unpriced.to_string()
+                    } else {
+                        String::new()
+                    },
+                    at,
+                    fmt_duration(t.oldest_secs),
+                    t.suggested.clone().unwrap_or_else(|| "-".into()),
+                    chaos_cell(t.value_chaos),
+                    if t.underpriced > 0 {
+                        format!("{} underpriced", t.underpriced)
+                    } else {
+                        String::new()
+                    },
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            render::table(
+                &[
+                    "tab",
+                    "items",
+                    "noprice",
+                    "at",
+                    "unchanged",
+                    "next",
+                    "value",
+                    "flags",
+                ],
+                &body,
+                38
+            )
+        );
+        println!();
     }
 
     if !report.underpriced.is_empty() {
@@ -1139,7 +1199,7 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
             "UNDERPRICED — listed below {}% of market",
             (settings.underprice_ratio * 100.0).round() as i64
         );
-        let body: Vec<Vec<String>> = report
+        let (body, extra) = cap(report
             .underpriced
             .iter()
             .map(|f| {
@@ -1152,7 +1212,7 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                     fmt_duration(f.age_secs),
                 ]
             })
-            .collect();
+            .collect());
         print!(
             "{}",
             render::table(
@@ -1161,18 +1221,19 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                 42
             )
         );
+        if extra > 0 {
+            println!("… and {extra} more");
+        }
         println!(
             "value at risk: {} if these sell as listed",
             chaos_cell(report.value_at_risk)
         );
+        println!();
     }
 
     if !report.unpriced.is_empty() {
-        if !report.underpriced.is_empty() {
-            println!();
-        }
         println!("NO PRICE — worth pricing");
-        let body: Vec<Vec<String>> = report
+        let (body, extra) = cap(report
             .unpriced
             .iter()
             .map(|f| {
@@ -1183,23 +1244,31 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                     fmt_duration(f.age_secs),
                 ]
             })
-            .collect();
+            .collect());
         print!(
             "{}",
             render::table(&["item", "tab", "value", "for"], &body, 42)
         );
+        if extra > 0 {
+            println!("… and {extra} more");
+        }
+        println!();
     }
 
     if !report.due.is_empty() {
-        if !report.underpriced.is_empty() || !report.unpriced.is_empty() {
-            println!();
-        }
         println!(
-            "DUE FOR A CUT — unchanged for {}h, cut {}%",
+            "DUE FOR A CUT — unchanged for {}h, {}",
             settings.cut_after_secs / 3600,
-            settings.cut_pct.round() as i64
+            if settings.cut_abs.is_some() {
+                format!(
+                    "step down {}",
+                    trim_num(settings.cut_abs.unwrap_or_default())
+                )
+            } else {
+                format!("cut {}%", settings.cut_pct.round() as i64)
+            }
         );
-        let body: Vec<Vec<String>> = report
+        let (body, extra) = cap(report
             .due
             .iter()
             .map(|f| {
@@ -1211,14 +1280,24 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                     fmt_duration(f.age_secs),
                 ]
             })
-            .collect();
+            .collect());
         print!(
             "{}",
             render::table(&["item", "tab", "now", "cut to", "for"], &body, 42)
         );
+        if extra > 0 {
+            println!("… and {extra} more");
+        }
+        println!();
     }
 
-    println!("\n{}", report.summary());
+    println!("{}", report.summary());
+}
+
+fn cap(mut rows: Vec<Vec<String>>) -> (Vec<Vec<String>>, usize) {
+    let extra = rows.len().saturating_sub(REPORT_ROWS);
+    rows.truncate(REPORT_ROWS);
+    (rows, extra)
 }
 
 /// Called after each stash pass so the reminder is impossible to miss.

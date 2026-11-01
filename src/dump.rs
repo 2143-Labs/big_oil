@@ -1,15 +1,19 @@
 //! Dump-tab health: underpricing and price decay.
 //!
-//! Two failure modes this catches:
+//! The practice this models: everything goes into a priced dump tab (often a
+//! quad tab at 1 divine, or a ladder of rotating tabs at 5c/10c/20c/50c/1div),
+//! and the price is stepped down every few hours or days until things sell.
+//! Two things cost money:
 //!
-//! * an item listed far below its market value (a typo, or a stale price on
-//!   something that got expensive) — money left on the table;
-//! * a tab nobody has touched in hours — sales stall because the price never
-//!   moves down.
+//! * an item worth far more than the tab price sitting in that tab — it sells
+//!   the instant someone sees it, at the tab price;
+//! * a tab nobody has touched, so the price never steps down and nothing moves.
 //!
-//! The decay clock is derived from the item's own price history, so the moment
-//! you re-price in game the watcher records a `price_changed` event and the
-//! reminder for that item disappears by itself.
+//! Because a tab price applies to every item in it, the useful unit is the tab,
+//! not the item. The report therefore leads with one line per tab and only
+//! lists individual items for mixed tabs or for genuine outliers.
+
+use std::collections::HashMap;
 
 use serde::Serialize;
 
@@ -45,6 +49,29 @@ pub struct Finding {
     pub currency: Option<String>,
 }
 
+/// Per-tab rollup: this is what a dump tab actually looks like.
+#[derive(Debug, Clone, Serialize)]
+pub struct TabSummary {
+    pub name: String,
+    pub items: usize,
+    pub priced: usize,
+    pub unpriced: usize,
+    /// The price most items share, when the tab is priced as a whole.
+    pub price: Option<String>,
+    pub price_amount: Option<f64>,
+    pub price_currency: Option<String>,
+    /// Most items share one price, so the tab is managed as a unit.
+    pub tab_priced: bool,
+    /// Age of the oldest item at its current price.
+    pub oldest_secs: i64,
+    pub due: bool,
+    pub suggested: Option<String>,
+    pub suggested_amount: Option<f64>,
+    pub underpriced: usize,
+    /// Total known market value of the tab's live items.
+    pub value_chaos: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// Tab name substring to restrict to (the dump tab).
@@ -59,6 +86,9 @@ pub struct Settings {
     pub cut_after_secs: i64,
     /// Cut size in percent.
     pub cut_pct: f64,
+    /// Step down by a fixed amount instead of a percentage (queue-method
+    /// ladders use a constant step, e.g. 10c).
+    pub cut_abs: Option<f64>,
 }
 
 impl Default for Settings {
@@ -70,23 +100,27 @@ impl Default for Settings {
             min_loss_chaos: 10.0,
             cut_after_secs: 12 * 3600,
             cut_pct: 20.0,
+            cut_abs: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Report {
+    pub tabs: Vec<TabSummary>,
     pub underpriced: Vec<Finding>,
     pub unpriced: Vec<Finding>,
     pub due: Vec<Finding>,
     /// Chaos of value missed if the underpriced items sell as listed.
     pub value_at_risk: f64,
-    pub tabs: Vec<String>,
 }
 
 impl Report {
     pub fn is_quiet(&self) -> bool {
-        self.underpriced.is_empty() && self.unpriced.is_empty() && self.due.is_empty()
+        self.underpriced.is_empty()
+            && self.unpriced.is_empty()
+            && self.due.is_empty()
+            && !self.tabs.iter().any(|t| t.due)
     }
 
     /// One-line summary, used for logs and desktop notifications.
@@ -102,8 +136,15 @@ impl Report {
         if !self.unpriced.is_empty() {
             parts.push(format!("{} unpriced", self.unpriced.len()));
         }
+        let due_tabs = self.tabs.iter().filter(|t| t.due).count();
+        if due_tabs > 0 {
+            parts.push(format!(
+                "{due_tabs} tab{} due a cut",
+                if due_tabs == 1 { "" } else { "s" }
+            ));
+        }
         if !self.due.is_empty() {
-            parts.push(format!("{} due for a cut", self.due.len()));
+            parts.push(format!("{} individual item(s) due", self.due.len()));
         }
         if parts.is_empty() {
             "nothing to do".to_string()
@@ -113,36 +154,127 @@ impl Report {
     }
 }
 
-pub fn analyze(rows: &[ItemRow], rates: &Rates, now: i64, settings: &Settings) -> Report {
-    let mut report = Report::default();
-    let mut underpriced_ids: Vec<String> = Vec::new();
+#[derive(Debug, Clone)]
+struct PriceCount {
+    amount: f64,
+    currency: String,
+    count: usize,
+    total: usize,
+}
 
-    for row in rows {
-        if row.source != "own" || row.delisted_at.is_some() {
-            continue;
-        }
-        if let Some(tab) = &settings.tab {
-            let name = row.stash_name.as_deref().unwrap_or_default();
-            if !name
-                .to_ascii_lowercase()
-                .contains(&tab.to_ascii_lowercase())
-            {
-                continue;
-            }
-        }
-        let tab = row.stash_name.clone();
-        if let Some(tab) = &tab
-            && !report.tabs.contains(tab)
+#[derive(Default)]
+struct TabAcc {
+    items: usize,
+    priced: usize,
+    unpriced: usize,
+    value: f64,
+    oldest: i64,
+    underpriced: usize,
+}
+
+const UNNAMED: &str = "<unnamed tab>";
+/// A tab counts as priced as a whole when most items share one price and there
+/// are enough of them to be a tab rather than a coincidence.
+const TAB_PRICED_MIN: usize = 3;
+const TAB_PRICED_SHARE: f64 = 0.6;
+
+fn tab_key(row: &ItemRow) -> String {
+    row.stash_name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| UNNAMED.to_string())
+}
+
+fn price_key(amount: f64, currency: &str) -> String {
+    format!("{amount:.4}|{}", currency.to_ascii_lowercase())
+}
+
+fn row_matches(row: &ItemRow, settings: &Settings) -> bool {
+    if row.source != "own" || row.delisted_at.is_some() {
+        return false;
+    }
+    if let Some(tab) = &settings.tab {
+        let name = row.stash_name.as_deref().unwrap_or_default();
+        if !name
+            .to_ascii_lowercase()
+            .contains(&tab.to_ascii_lowercase())
         {
-            report.tabs.push(tab.clone());
+            return false;
         }
+    }
+    true
+}
+
+pub fn analyze(rows: &[ItemRow], rates: &Rates, now: i64, settings: &Settings) -> Report {
+    let live: Vec<&ItemRow> = rows.iter().filter(|r| row_matches(r, settings)).collect();
+
+    // Pass 1: what price does each tab's stock share?
+    let mut counts: HashMap<String, HashMap<String, PriceCount>> = HashMap::new();
+    for row in &live {
+        let Some(amount) = row.price_amount else {
+            continue;
+        };
+        let Some(currency) = row.price_currency.as_deref() else {
+            continue;
+        };
+        let entry = counts
+            .entry(tab_key(row))
+            .or_default()
+            .entry(price_key(amount, currency))
+            .or_insert_with(|| PriceCount {
+                amount,
+                currency: currency.to_owned(),
+                count: 0,
+                total: 0,
+            });
+        entry.count += 1;
+    }
+    for per_tab in counts.values_mut() {
+        let total: usize = per_tab.values().map(|c| c.count).sum();
+        for count in per_tab.values_mut() {
+            count.total = total;
+        }
+    }
+
+    // A tab is "priced as a whole" when most of its stock shares one price.
+    let dominant_by_tab: HashMap<String, PriceCount> = counts
+        .iter()
+        .filter_map(|(tab, per_tab)| {
+            per_tab
+                .values()
+                .max_by_key(|c| c.count)
+                .filter(|c| c.count >= TAB_PRICED_MIN)
+                .filter(|c| c.count as f64 >= c.total as f64 * TAB_PRICED_SHARE)
+                .cloned()
+                .map(|d| (tab.clone(), d))
+        })
+        .collect();
+
+    let mut report = Report::default();
+    let mut accs: HashMap<String, TabAcc> = HashMap::new();
+
+    for row in &live {
+        let tab = tab_key(row);
+        let acc = accs.entry(tab.clone()).or_default();
+        acc.items += 1;
 
         let age = now - row.price_since.unwrap_or(row.first_seen);
+        acc.oldest = acc.oldest.max(age);
+
         let value = row.value_chaos.filter(|v| *v > 0.0);
+        if let Some(value) = value {
+            acc.value += value;
+        }
         let listed_chaos = row
             .price_amount
             .zip(row.price_currency.as_deref())
             .and_then(|(amount, currency)| rates.chaos_per_unit(currency).map(|r| amount * r));
+
+        if row.price_amount.is_some() {
+            acc.priced += 1;
+        } else {
+            acc.unpriced += 1;
+        }
 
         let mut flagged = false;
 
@@ -155,13 +287,13 @@ pub fn analyze(rows: &[ItemRow], rates: &Rates, now: i64, settings: &Settings) -
                     && loss >= settings.min_loss_chaos
                 {
                     flagged = true;
-                    underpriced_ids.push(row.id.clone());
+                    acc.underpriced += 1;
                     report.value_at_risk += loss;
                     report.underpriced.push(Finding {
                         kind: Kind::Underpriced,
                         id: row.id.clone(),
                         name: row.display_name(),
-                        tab: tab.clone(),
+                        tab: row.stash_name.clone(),
                         listed: row.price().map(|p| strip_kind(&p)),
                         listed_chaos: Some(listed),
                         value_chaos: Some(value),
@@ -182,7 +314,7 @@ pub fn analyze(rows: &[ItemRow], rates: &Rates, now: i64, settings: &Settings) -
                     kind: Kind::Unpriced,
                     id: row.id.clone(),
                     name: row.display_name(),
-                    tab: tab.clone(),
+                    tab: row.stash_name.clone(),
                     listed: None,
                     listed_chaos: None,
                     value_chaos: Some(value),
@@ -198,20 +330,29 @@ pub fn analyze(rows: &[ItemRow], rates: &Rates, now: i64, settings: &Settings) -
         }
 
         // Any priced item that has been sitting still long enough gets a cut
-        // suggestion — except the ones already flagged as too cheap.
+        // suggestion — except items already flagged as too cheap, and items
+        // that merely share their tab's price (the tab row covers those).
+        let shares_tab_price = row
+            .price_amount
+            .zip(row.price_currency.as_deref())
+            .is_some_and(|(amount, currency)| {
+                dominant_by_tab.get(&tab).is_some_and(|d| {
+                    price_key(amount, currency) == price_key(d.amount, &d.currency)
+                })
+            });
         if !flagged
+            && !shares_tab_price
             && let (Some(amount), Some(currency)) =
                 (row.price_amount, row.price_currency.as_deref())
             && amount > 0.0
             && age >= settings.cut_after_secs
         {
-            let cut = amount * (1.0 - settings.cut_pct / 100.0);
-            let suggested = round_price(cut, currency);
+            let suggested = step(amount, currency, settings);
             report.due.push(Finding {
                 kind: Kind::DueForCut,
                 id: row.id.clone(),
                 name: row.display_name(),
-                tab: tab.clone(),
+                tab: row.stash_name.clone(),
                 listed: row.price().map(|p| strip_kind(&p)),
                 listed_chaos,
                 value_chaos: value,
@@ -225,6 +366,49 @@ pub fn analyze(rows: &[ItemRow], rates: &Rates, now: i64, settings: &Settings) -
         }
     }
 
+    // Roll tabs up into one row each.
+    for (name, acc) in accs {
+        let dominant = dominant_by_tab.get(&name).cloned();
+        let tab_priced = dominant.is_some();
+
+        let due = tab_priced && acc.oldest >= settings.cut_after_secs;
+        let suggested = if due {
+            dominant
+                .as_ref()
+                .map(|d| format_price(step(d.amount, &d.currency, settings), &d.currency))
+        } else {
+            None
+        };
+
+        report.tabs.push(TabSummary {
+            name: name.clone(),
+            items: acc.items,
+            priced: acc.priced,
+            unpriced: acc.unpriced,
+            price: dominant
+                .as_ref()
+                .map(|d| format_price_raw(d.amount, &d.currency)),
+            price_amount: dominant.as_ref().map(|d| d.amount),
+            price_currency: dominant.as_ref().map(|d| d.currency.clone()),
+            tab_priced,
+            oldest_secs: acc.oldest,
+            due,
+            suggested,
+            suggested_amount: dominant
+                .as_ref()
+                .filter(|_| due)
+                .map(|d| step(d.amount, &d.currency, settings)),
+            underpriced: acc.underpriced,
+            value_chaos: acc.value,
+        });
+    }
+
+    report.tabs.sort_by(|a, b| {
+        b.underpriced
+            .cmp(&a.underpriced)
+            .then_with(|| b.due.cmp(&a.due))
+            .then_with(|| b.oldest_secs.cmp(&a.oldest_secs))
+    });
     report.underpriced.sort_by(|a, b| {
         b.loss_chaos
             .unwrap_or(0.0)
@@ -258,12 +442,25 @@ fn format_price(amount: f64, currency: &str) -> String {
     }
 }
 
-/// Keep suggestions trade-shaped: whole chaos, one decimal for everything else.
-fn round_price(amount: f64, currency: &str) -> f64 {
-    if currency.eq_ignore_ascii_case("chaos") {
-        amount.floor().max(1.0)
+fn format_price_raw(amount: f64, currency: &str) -> String {
+    if (amount - amount.round()).abs() < f64::EPSILON {
+        format!("{} {}", amount.round() as i64, currency)
     } else {
-        ((amount * 10.0).round() / 10.0).max(0.1)
+        format!("{amount:.1} {}", currency)
+    }
+}
+
+/// Next step down: a fixed amount when `cut_abs` is set (queue-method ladders),
+/// otherwise a percentage. Rounded to trade-shaped numbers.
+fn step(amount: f64, currency: &str, settings: &Settings) -> f64 {
+    let raw = match settings.cut_abs {
+        Some(absolute) => amount - absolute,
+        None => amount * (1.0 - settings.cut_pct / 100.0),
+    };
+    if currency.eq_ignore_ascii_case("chaos") {
+        raw.floor().max(1.0)
+    } else {
+        ((raw * 10.0).round() / 10.0).max(0.1)
     }
 }
 
@@ -314,6 +511,11 @@ mod tests {
         }
     }
 
+    fn aged(mut row: ItemRow, secs: i64) -> ItemRow {
+        row.price_since = Some(NOW - secs);
+        row
+    }
+
     const NOW: i64 = 100 * 3600;
 
     #[test]
@@ -339,7 +541,6 @@ mod tests {
 
     #[test]
     fn ignores_cheap_items_and_small_gaps() {
-        // Worth 15c: below min_value_chaos.
         let rows = [item("Trinket", Some(0.01), Some("divine"), Some(15.0))];
         assert!(
             analyze(&rows, &rates(400.0), NOW, &Settings::default())
@@ -347,7 +548,6 @@ mod tests {
                 .is_empty()
         );
 
-        // Worth 100c, listed at 60c: a 40c gap, under the 50% ratio? no (0.6).
         let rows = [item("Mid", Some(60.0), Some("chaos"), Some(100.0))];
         assert!(
             analyze(&rows, &rates(400.0), NOW, &Settings::default())
@@ -366,8 +566,10 @@ mod tests {
 
     #[test]
     fn suggests_a_cut_after_the_interval() {
-        let mut row = item("Mageblood", Some(10.0), Some("divine"), Some(4000.0));
-        row.price_since = Some(NOW - 13 * 3600);
+        let row = aged(
+            item("Mageblood", Some(10.0), Some("divine"), Some(4000.0)),
+            13 * 3600,
+        );
         let report = analyze(&[row], &rates(400.0), NOW, &Settings::default());
         assert_eq!(report.due.len(), 1);
         assert_eq!(report.due[0].suggested.as_deref(), Some("8 divine"));
@@ -376,8 +578,10 @@ mod tests {
 
     #[test]
     fn young_listings_are_not_due() {
-        let mut row = item("Mageblood", Some(10.0), Some("divine"), Some(4000.0));
-        row.price_since = Some(NOW - 3600);
+        let row = aged(
+            item("Mageblood", Some(10.0), Some("divine"), Some(4000.0)),
+            3600,
+        );
         assert!(
             analyze(&[row], &rates(400.0), NOW, &Settings::default())
                 .due
@@ -387,8 +591,10 @@ mod tests {
 
     #[test]
     fn chaos_cuts_are_whole_numbers() {
-        let mut row = item("Ring", Some(15.0), Some("chaos"), Some(15.0));
-        row.price_since = Some(NOW - 13 * 3600);
+        let row = aged(
+            item("Ring", Some(15.0), Some("chaos"), Some(15.0)),
+            13 * 3600,
+        );
         let report = analyze(&[row], &rates(400.0), NOW, &Settings::default());
         assert_eq!(report.due[0].suggested.as_deref(), Some("12 chaos"));
     }
@@ -403,6 +609,7 @@ mod tests {
         };
         let report = analyze(&[row], &rates(400.0), NOW, &settings);
         assert!(report.is_quiet());
+        assert!(report.tabs.is_empty());
     }
 
     #[test]
@@ -411,5 +618,116 @@ mod tests {
         let report = analyze(&rows, &rates(400.0), NOW, &Settings::default());
         assert!(report.underpriced.is_empty());
         assert!(report.unpriced.is_empty(), "it does have a price");
+    }
+
+    #[test]
+    fn a_tab_priced_as_a_whole_is_reported_as_one_row() {
+        // A quad dump tab at 1 divine, 26h stale.
+        let rows: Vec<ItemRow> = (0..40)
+            .map(|i| {
+                aged(
+                    item(
+                        &format!("item{i}"),
+                        Some(1.0),
+                        Some("divine"),
+                        Some(500.0 + i as f64),
+                    ),
+                    26 * 3600,
+                )
+            })
+            .collect();
+        let report = analyze(&rows, &rates(400.0), NOW, &Settings::default());
+
+        assert_eq!(report.tabs.len(), 1, "one tab");
+        let tab = &report.tabs[0];
+        assert!(tab.tab_priced, "40 items at 1 divine is a tab price");
+        assert_eq!(tab.items, 40);
+        assert_eq!(tab.price.as_deref(), Some("1 divine"));
+        assert!(tab.due);
+        assert_eq!(tab.suggested.as_deref(), Some("0.8 divine"));
+        assert!(
+            report.due.is_empty(),
+            "per-item rows are redundant once the tab is summarised"
+        );
+    }
+
+    #[test]
+    fn a_mixed_tab_keeps_per_item_rows() {
+        let rows = vec![
+            aged(
+                item("a", Some(10.0), Some("divine"), Some(4000.0)),
+                13 * 3600,
+            ),
+            aged(item("b", Some(5.0), Some("chaos"), Some(5.0)), 13 * 3600),
+            aged(item("c", Some(1.0), Some("divine"), Some(500.0)), 13 * 3600),
+        ];
+        let report = analyze(&rows, &rates(400.0), NOW, &Settings::default());
+        assert_eq!(report.tabs.len(), 1);
+        assert!(!report.tabs[0].tab_priced, "three different prices");
+        assert_eq!(report.due.len(), 3);
+    }
+
+    #[test]
+    fn a_tab_under_the_cut_interval_is_not_due() {
+        let rows: Vec<ItemRow> = (0..10)
+            .map(|i| {
+                aged(
+                    item(&format!("i{i}"), Some(2.0), Some("divine"), Some(4000.0)),
+                    3600,
+                )
+            })
+            .collect();
+        let report = analyze(&rows, &rates(400.0), NOW, &Settings::default());
+        assert!(report.tabs[0].tab_priced);
+        assert!(!report.tabs[0].due);
+        assert!(!report.tabs[0].suggested.is_some());
+    }
+
+    #[test]
+    fn an_outlier_in_a_priced_tab_is_still_listed() {
+        // The whole tab is 1 divine, but one item is worth 40 divine: the tab
+        // summary says "3 underpriced" and the section names it.
+        let mut rows: Vec<ItemRow> = (0..10)
+            .map(|i| {
+                aged(
+                    item(
+                        &format!("filler{i}"),
+                        Some(1.0),
+                        Some("divine"),
+                        Some(400.0),
+                    ),
+                    26 * 3600,
+                )
+            })
+            .collect();
+        rows.push(aged(
+            item("Headhunter", Some(1.0), Some("divine"), Some(16_000.0)),
+            26 * 3600,
+        ));
+        let report = analyze(&rows, &rates(400.0), NOW, &Settings::default());
+
+        assert_eq!(report.tabs[0].underpriced, 1);
+        assert_eq!(report.underpriced.len(), 1);
+        assert_eq!(report.underpriced[0].name, "Headhunter (Leather Belt)");
+        assert!(report.value_at_risk > 14_000.0);
+    }
+
+    #[test]
+    fn fixed_step_ladders_use_an_absolute_cut() {
+        // Queue method: 50c tab, 10c interval.
+        let rows: Vec<ItemRow> = (0..10)
+            .map(|i| {
+                aged(
+                    item(&format!("i{i}"), Some(50.0), Some("chaos"), Some(20.0)),
+                    13 * 3600,
+                )
+            })
+            .collect();
+        let settings = Settings {
+            cut_abs: Some(10.0),
+            ..Default::default()
+        };
+        let report = analyze(&rows, &rates(400.0), NOW, &settings);
+        assert_eq!(report.tabs[0].suggested.as_deref(), Some("40 chaos"));
     }
 }

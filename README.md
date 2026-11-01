@@ -115,47 +115,62 @@ category set is ~3 MB; `--all` adds gems and base types (~6 MB more).
 
 ## Underpricing and price decay
 
-The two ways a dump tab loses money, computed from the notes you typed against
-the poe.ninja snapshot:
+The workflow this is built around: dump every drop into a premium/quad tab,
+price the whole tab at once (tab prices apply to every item in it), and step the
+price down every few hours or days until things move. Or run a ladder of tabs —
+5c / 10c / 20c / 50c / 1div — and move items down it. Either way there are two
+ways to lose money: an item worth far more than the tab price sells instantly at
+the tab price, and a tab nobody touches never gets cheaper.
 
-```sh
-big_oil dump --league Allflame
-big_oil dump --league Allflame --tab dump --underpriced 50 --every 12h --cut 20
-big_oil stash watch --league Allflame --tab-name dump --notify   # alert each pass
-```
+Because the price is a property of the tab, the report leads with tabs:
 
 ```
-market values from 2026-11-01T02:22:01Z (55s old)
+market values from 2026-11-01T02:22:01Z (3h old)
+
+TABS
+TAB   ITEMS  NOPRICE  AT        UNCHANGED  NEXT        VALUE  FLAGS
+Dump  13              1 divine  1d         0.8 divine  6136c  2 underpriced
 
 UNDERPRICED — listed below 50% of market
-ITEM                       TAB   LISTED    VALUE  MISSING  FOR
-Headhunter (Leather Belt)  Dump  1 divine  4542c  4222c    49s
-value at risk: 4222c if these sell as listed
+ITEM                               TAB   LISTED    VALUE  MISSING  FOR
+Headhunter (Leather Belt)          Dump  1 divine  4542c  4222c    1d
+Pearl of Tsoatha (Prismatic Ring)  Dump  1 divine  1514c  1194c    1d
+value at risk: 5417c if these sell as listed
 
-NO PRICE — worth pricing
-ITEM                    TAB   VALUE    FOR
-Mageblood (Heavy Belt)  Dump  488265c  49s
-
-DUE FOR A CUT — unchanged for 12h, cut 20%
-ITEM             TAB   NOW        CUT TO     FOR
-Chaos Orb        Dump  500 chaos  400 chaos  13h
+2 underpriced (~5417c at risk), 1 tab due a cut
 ```
 
-- **UNDERPRICED** — listed below `--underpriced` percent of market, worth at
-  least `--min-value` chaos, missing at least `--min-loss` chaos. Sorted by
-  value at risk.
-- **NO PRICE** — valuable items with no note at all (the other way to leave
-  money on the table).
-- **DUE FOR A CUT** — priced items unchanged for `--every`, with the suggested
-  price (`current × (1 - cut%)`, rounded to whole chaos or one decimal).
-  Underpriced items are never suggested for a further cut.
+```sh
+big_oil dump --league Allflame --tab dump            # before pricing a filled tab
+big_oil dump --league Allflame --every 6h --cut 20   # soak time before the next cut
+big_oil dump --league Allflame --step 10             # ladder: 50c -> 40c
+big_oil stash watch --league Allflame --tab-name dump --notify
+```
 
-Notes are converted to chaos using the currency overview, including the short
-forms people type (`divine`, `alch`, `exalt`, `mirror`, `fuse`, `alt`, …).
+- **TABS** — one row per tab: item count, unpriced count, the price most items
+  share, how long the oldest item has been at that price, the next step, total
+  market value, and how many outliers sit inside it. A 400-item quad tab is one
+  row, not 400.
+- **UNDERPRICED** — items listed below `--underpriced` percent of market, worth
+  at least `--min-value` chaos, missing at least `--min-loss` chaos. This is the
+  list to check before you set a tab price, and the one that catches an item
+  whose market moved after you priced the tab.
+- **NO PRICE** — valuable items with no note. In a tab-priced tab everything
+  inherits the price, so this only shows up in unpriced tabs or manual notes.
+- **DUE FOR A CUT** — per-item rows, shown only for mixed tabs (items with
+  individual prices); tab-priced tabs are covered by their TABS row.
+
+Stepping down: `--cut` takes a percentage of the current price, `--step` takes a
+fixed amount in the tab's own currency (the queue-method ladder: 50c → 40c with
+`--step 10`). Suggestions round to whole chaos or one decimal.
+
+Notes are converted to chaos using the currency overview, including short forms
+(`divine`, `alch`, `exalt`, `mirror`, `fuse`, `alt`, …).
 
 The decay clock is the item's own price history: the next stash pass sees your
 new note as a `price_changed` event, so the reminder clears itself once you
-re-price. Moving an item between tabs does **not** restart it.
+re-price. Moving an item down the ladder resets it only because the new tab's
+price changed the note; a move that keeps the same price does not.
 
 Limits to keep in mind: poe.ninja prices types, not instances, so rares (and
 uniques with indistinguishable variants) can only ever appear under DUE FOR A
