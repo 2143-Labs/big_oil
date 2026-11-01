@@ -14,6 +14,7 @@ use big_oil::auth;
 use big_oil::client::{self, Client};
 use big_oil::config::Config;
 use big_oil::dump::{self, Settings as DumpSettings};
+use big_oil::extract::{self, Settings as ExtractSettings};
 use big_oil::model::StashPage;
 use big_oil::ninja::{self, NinjaClient, Overview};
 use big_oil::own::OwnClient;
@@ -79,6 +80,8 @@ enum Command {
     },
     /// Underpriced items and overdue price cuts
     Dump(DumpArgs),
+    /// Triage a freshly identified tab: what to pull, what is stuck
+    Extract(ExtractArgs),
     /// Print config, token and database paths
     Paths,
 }
@@ -224,6 +227,26 @@ struct DumpArgs {
 }
 
 #[derive(clap::Args)]
+struct ExtractArgs {
+    #[arg(long, env = "BIG_OIL_LEAGUE")]
+    league: String,
+    /// Tab name substring (your dump tab)
+    #[arg(long)]
+    tab: Option<String>,
+    /// Ignore items worth less than this many chaos
+    #[arg(long, default_value_t = 5.0)]
+    min_value: f64,
+    /// Pull when an item is worth this percent of the tab price
+    #[arg(long, default_value_t = 150.0)]
+    pull: f64,
+    /// Stuck when an item is worth at most 100/this percent of the tab price
+    #[arg(long, default_value_t = 200.0)]
+    stuck: f64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
 struct Search {
     #[arg(long)]
     league: Option<String>,
@@ -306,6 +329,7 @@ fn run() -> Result<()> {
             } => ninja_fetch_cmd(&cfg, &league, types, all, no_currency, base_url),
         },
         Command::Dump(args) => run_dump(&cfg, args),
+        Command::Extract(args) => run_extract(&cfg, args),
         Command::Paths => {
             for (name, path) in cfg.layout() {
                 println!("{name:<9} {path}");
@@ -1104,6 +1128,7 @@ fn build_report(store: &Store, league: &str, settings: &DumpSettings) -> Result<
     let rates = Rates::from_lines(&lines);
     let rows = store.search(&SearchQuery {
         source: Some("own".into()),
+        league: Some(league.to_string()),
         limit: 100_000,
         ..Default::default()
     })?;
@@ -1309,6 +1334,7 @@ fn alert_dump(store: &Store, league: &str, notify: bool) {
     let rates = Rates::from_lines(&lines);
     let rows = match store.search(&SearchQuery {
         source: Some("own".into()),
+        league: Some(league.to_string()),
         limit: 100_000,
         ..Default::default()
     }) {
@@ -1353,4 +1379,122 @@ fn fmt_duration(secs: i64) -> String {
     } else {
         format!("{}d", secs / 86_400)
     }
+}
+
+fn run_extract(cfg: &Config, args: ExtractArgs) -> Result<()> {
+    let store = open_store(cfg)?;
+    let lines = store.price_lines(&args.league)?;
+    if lines.is_empty() {
+        bail!(
+            "no price snapshot for {}: run `big_oil ninja fetch --league {}` first",
+            args.league,
+            args.league
+        );
+    }
+    let rates = Rates::from_lines(&lines);
+    let rows = store.search(&SearchQuery {
+        source: Some("own".into()),
+        league: Some(args.league.clone()),
+        limit: 100_000,
+        ..Default::default()
+    })?;
+    let settings = ExtractSettings {
+        tab: args.tab.clone(),
+        min_value_chaos: args.min_value.max(0.0),
+        pull_ratio: (args.pull / 100.0).max(1.0),
+        stuck_ratio: (args.stuck / 100.0).max(1.0),
+    };
+    let report = extract::analyze(&rows, &rates, &settings);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print_extract(&report);
+    Ok(())
+}
+
+fn print_extract(report: &extract::Report) {
+    if report.tabs.is_empty() {
+        println!("no own-tab items match; run `big_oil stash watch` first");
+        return;
+    }
+    let price = match (&report.tab_price, report.tab_price_chaos) {
+        (Some(p), Some(c)) => format!("{p} (~{}c)", trim_num(c)),
+        (Some(p), None) => p.clone(),
+        _ => "unpriced".to_string(),
+    };
+    println!(
+        "{} — {} items, tab price {}",
+        report.tabs.join(", "),
+        report.items,
+        price
+    );
+
+    if !report.unidentified.is_empty() {
+        println!();
+        println!(
+            "ID FIRST ({}) — an unidentified unique could be anything",
+            report.unidentified.len()
+        );
+        let (body, extra) = cap(report
+            .unidentified
+            .iter()
+            .map(|r| vec![r.pos_cell(), r.name.clone(), r.kind().to_string()])
+            .collect());
+        print!("{}", render::table(&["pos", "item", "type"], &body, 40));
+        if extra > 0 {
+            println!("… and {extra} more");
+        }
+    }
+
+    if !report.liquid.is_empty() {
+        println!();
+        println!(
+            "LIQUID ({}) — priced by poe.ninja; pull when worth more than the tab",
+            report.liquid.len()
+        );
+        let (body, extra) = cap(report
+            .liquid
+            .iter()
+            .map(|r| {
+                vec![
+                    r.pos_cell(),
+                    r.name.clone(),
+                    r.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
+                    r.times
+                        .map(|t| {
+                            if t >= 1.0 {
+                                format!("{t:.1}x")
+                            } else {
+                                format!("{t:.2}x")
+                            }
+                        })
+                        .unwrap_or_else(|| "-".into()),
+                    r.listings
+                        .map(|l| l.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    match r.verdict {
+                        extract::Verdict::Pull => "PULL",
+                        extract::Verdict::Fair => "fair",
+                        extract::Verdict::Stuck => "stuck",
+                        extract::Verdict::Unidentified => "id",
+                    }
+                    .to_string(),
+                ]
+            })
+            .collect());
+        print!(
+            "{}",
+            render::table(
+                &["pos", "item", "value", "tab×", "listings", "verdict"],
+                &body,
+                42
+            )
+        );
+        if extra > 0 {
+            println!("… and {extra} more");
+        }
+    }
+
+    println!("\n{}", report.summary());
 }

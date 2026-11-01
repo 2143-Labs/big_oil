@@ -180,6 +180,45 @@ CUT, and a stale snapshot (shown at the top of the report) means stale values �
 `--notify` shells out to `notify-send -u critical` for the summary line, from
 both `dump` and `stash watch`.
 
+## Triage after a mapping session
+
+The loop this is built for: dump drops unidentified, identify the tab, price the
+tab, then pull out the liquid stuff worth more than the tab price and leave the
+rest to decay.
+
+```sh
+big_oil extract --league Allflame --tab dump
+```
+```
+Dump — 11 items, tab price 1 divine (~320c)
+
+ID FIRST (1) — an unidentified unique could be anything
+POS    ITEM          TYPE
+(5,5)  Leather Belt  unique
+
+LIQUID (3) — priced by poe.ninja; pull when worth more than the tab
+POS    ITEM                                 VALUE  TAB×   LISTINGS  VERDICT
+(7,3)  Headhunter (Leather Belt)            4542c  14.2x  477       PULL
+(2,0)  Circle of Ambition (Prismatic Ring)  10c    0.03x  23548     stuck
+(5,0)  The Eternal Struggle (Onyx Amulet)   5c     0.02x  19608     stuck
+
+1 to pull (4542c), 0 fair, 2 stuck, 7 illiquid, 1 unidentified
+```
+
+- **ID FIRST** — unidentified items can't be valued, and an unidentified unique
+  can be anything. These are listed before anything else, unique frame first.
+- **LIQUID** — items poe.ninja prices (uniques, gems, currency, cards, maps),
+  with the stash position so you can find them in the tab. `PULL` at ≥150% of
+  the listed price (default), `fair` in between, `stuck` below half.
+- **LISTINGS** — supply for the matched market line, a rough liquidity signal
+  for "will this sell quickly".
+- Rares are counted as illiquid rather than guessed at: nothing offline prices
+  an individual rare.
+
+`--min-value` (default 5c) keeps junk out, `--pull` / `--stuck` tune the
+verdict thresholds. Positions come from the stash response, so they are the
+in-tab coordinates.
+
 ## Build
 
 ```sh
@@ -204,6 +243,7 @@ paths      Config, token and database locations
 stash      watch | list | value   (your own tabs)
 ninja      fetch                  (poe.ninja economy snapshot)
 dump       Underpriced items and overdue price cuts (--json, --notify)
+extract    Triage a freshly identified tab: what to pull, what is stuck
 ```
 
 Search filters: `--league --name --base --rarity --account --mods --min-ilvl

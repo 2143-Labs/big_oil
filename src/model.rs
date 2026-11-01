@@ -70,6 +70,9 @@ pub struct Item {
     pub gem_level: Option<i64>,
     pub gem_quality: Option<i64>,
     pub map_tier: Option<i64>,
+    /// Stash position, so a report can say where to find the item.
+    pub x: Option<i64>,
+    pub y: Option<i64>,
     pub icon: Option<String>,
     /// Free text the seller typed; price notes (`~b/o 1 divine`) live here.
     pub note: Option<String>,
@@ -145,6 +148,8 @@ impl Item {
             gem_level: property_number(v, "Level"),
             gem_quality: property_number(v, "Quality"),
             map_tier: property_number(v, "Map Tier"),
+            x: int_field(v, "x"),
+            y: int_field(v, "y"),
             icon: str_field(v, "icon"),
             note: str_field(v, "note"),
             mods_text: mods.join("\n"),

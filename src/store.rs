@@ -63,10 +63,13 @@ CREATE TABLE IF NOT EXISTS items (
     gem_level      INTEGER,
     gem_quality    INTEGER,
     map_tier       INTEGER,
+    x              INTEGER,
+    y              INTEGER,
     source         TEXT NOT NULL DEFAULT 'stream',
     value_chaos    REAL,
     value_divine   REAL,
     valued_at      INTEGER,
+    value_listings INTEGER,
     first_seen     INTEGER NOT NULL,
     last_seen      INTEGER NOT NULL,
     delisted_at    INTEGER,
@@ -238,6 +241,12 @@ pub struct ItemRow {
     pub value_chaos: Option<f64>,
     pub value_divine: Option<f64>,
     pub valued_at: Option<i64>,
+    /// Supply for the matched market line, a rough liquidity signal.
+    pub value_listings: Option<i64>,
+    pub identified: Option<bool>,
+    pub frame_type: Option<i64>,
+    pub x: Option<i64>,
+    pub y: Option<i64>,
     pub first_seen: i64,
     pub last_seen: i64,
     pub delisted_at: Option<i64>,
@@ -796,8 +805,9 @@ impl Store {
                 continue;
             };
             tx.execute(
-                "UPDATE items SET value_chaos = ?2, value_divine = ?3, valued_at = ?4 WHERE id = ?1",
-                params![id, line.chaos, line.divine, now],
+                "UPDATE items SET value_chaos = ?2, value_divine = ?3, valued_at = ?4,
+                                  value_listings = ?5 WHERE id = ?1",
+                params![id, line.chaos, line.divine, now, line.listing_count],
             )?;
             let matched = format!(
                 "{}:{}",
@@ -942,7 +952,8 @@ const ITEM_SELECT: &str =
     "SELECT i.id, i.stash_id, s.name, i.account, i.league, i.name, i.type_line,
         i.base_type, i.rarity, i.ilvl, i.stack_size, i.sockets, i.links, i.corrupted, i.note,
         i.price_amount, i.price_currency, i.price_type, i.source, i.value_chaos, i.value_divine,
-        i.valued_at, i.first_seen, i.last_seen, i.delisted_at,
+        i.valued_at, i.value_listings, i.identified, i.x, i.y,
+        i.first_seen, i.last_seen, i.delisted_at, i.frame_type,
         COALESCE(
             (SELECT MAX(l.at) FROM listings l WHERE l.item_id = i.id AND l.event = 'price_changed'),
             (SELECT MIN(l.at) FROM listings l WHERE l.item_id = i.id AND l.event IN ('listed', 'dropped')),
@@ -974,10 +985,15 @@ fn item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
         value_chaos: r.get(19)?,
         value_divine: r.get(20)?,
         valued_at: r.get(21)?,
-        first_seen: r.get(22)?,
-        last_seen: r.get(23)?,
-        delisted_at: r.get(24)?,
-        price_since: r.get(25)?,
+        first_seen: r.get(26)?,
+        last_seen: r.get(27)?,
+        delisted_at: r.get(28)?,
+        frame_type: r.get(29)?,
+        price_since: r.get(30)?,
+        value_listings: r.get(22)?,
+        identified: r.get::<_, Option<i64>>(23)?.map(|v| v != 0),
+        x: r.get(24)?,
+        y: r.get(25)?,
     })
 }
 
@@ -1202,10 +1218,10 @@ fn upsert_item(
         "INSERT INTO items(
             id, stash_id, league, account, name, type_line, base_type, rarity, frame_type, ilvl,
             stack_size, sockets, links, corrupted, identified, icon, note, price_amount,
-            price_currency, price_type, mods_text, gem_level, gem_quality, map_tier, source,
-            first_seen, last_seen, delisted_at, raw)
+            price_currency, price_type, mods_text, gem_level, gem_quality, map_tier, x, y,
+            source, first_seen, last_seen, delisted_at, raw)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?26, NULL, ?27)
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?28, NULL, ?29)
          ON CONFLICT(id) DO UPDATE SET
             stash_id       = excluded.stash_id,
             league         = COALESCE(excluded.league, items.league),
@@ -1230,6 +1246,8 @@ fn upsert_item(
             gem_level      = excluded.gem_level,
             gem_quality    = excluded.gem_quality,
             map_tier       = excluded.map_tier,
+            x              = excluded.x,
+            y              = excluded.y,
             source         = excluded.source,
             last_seen      = excluded.last_seen,
             delisted_at    = NULL,
@@ -1259,6 +1277,8 @@ fn upsert_item(
             item.gem_level,
             item.gem_quality,
             item.map_tier,
+            item.x,
+            item.y,
             source,
             now,
             item.raw,
@@ -1367,6 +1387,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("items", "gem_level", "INTEGER"),
         ("items", "gem_quality", "INTEGER"),
         ("items", "map_tier", "INTEGER"),
+        ("items", "x", "INTEGER"),
+        ("items", "y", "INTEGER"),
+        ("items", "value_listings", "INTEGER"),
     ] {
         if !has_column(table, column)? {
             conn.execute(
