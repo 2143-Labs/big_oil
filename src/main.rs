@@ -17,6 +17,7 @@ use big_oil::dump::{self, Settings as DumpSettings};
 use big_oil::extract::{self, Settings as ExtractSettings};
 use big_oil::model::StashPage;
 use big_oil::ninja::{self, NinjaClient, Overview};
+use big_oil::overlay::{self, Calibration};
 use big_oil::own::OwnClient;
 use big_oil::rates::Rates;
 use big_oil::render;
@@ -82,6 +83,8 @@ enum Command {
     Dump(DumpArgs),
     /// Triage a freshly identified tab: what to pull, what is stuck
     Extract(ExtractArgs),
+    /// In-game overlay: coloured frames around the items in the open tab
+    Overlay(OverlayArgs),
     /// Print config, token and database paths
     Paths,
 }
@@ -247,6 +250,24 @@ struct ExtractArgs {
 }
 
 #[derive(clap::Args)]
+struct OverlayArgs {
+    #[arg(long, env = "BIG_OIL_LEAGUE")]
+    league: String,
+    /// Tab name substring (the tab you are looking at)
+    #[arg(long)]
+    tab: Option<String>,
+    /// little_oil config with stash_region + stash_grid
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+    /// Green when an item is worth at least this percent of its listed price
+    #[arg(long, default_value_t = 150.0)]
+    cheap: f64,
+    /// Print the calibration and the marks, draw nothing
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(clap::Args)]
 struct Search {
     #[arg(long)]
     league: Option<String>,
@@ -330,6 +351,7 @@ fn run() -> Result<()> {
         },
         Command::Dump(args) => run_dump(&cfg, args),
         Command::Extract(args) => run_extract(&cfg, args),
+        Command::Overlay(args) => run_overlay(&cfg, args),
         Command::Paths => {
             for (name, path) in cfg.layout() {
                 println!("{name:<9} {path}");
@@ -1497,4 +1519,76 @@ fn print_extract(report: &extract::Report) {
     }
 
     println!("\n{}", report.summary());
+}
+
+fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
+    let store = open_store(cfg)?;
+    let lines = store.price_lines(&args.league)?;
+    if lines.is_empty() {
+        tracing::warn!(
+            "no price snapshot for {}; every item will be drawn grey. Run `big_oil ninja fetch --league {}`",
+            args.league,
+            args.league
+        );
+    }
+    let rates = Rates::from_lines(&lines);
+    let rows = store.search(&SearchQuery {
+        source: Some("own".into()),
+        league: Some(args.league.clone()),
+        limit: 100_000,
+        ..Default::default()
+    })?;
+
+    let path = args
+        .config
+        .clone()
+        .unwrap_or_else(Calibration::default_little_oil_path);
+    let calibration = Calibration::from_little_oil(&path)?;
+
+    let settings = overlay::Settings {
+        cheap_ratio: (args.cheap / 100.0).max(1.0),
+    };
+    let marks = overlay::marks(&rows, &rates, &calibration, &settings);
+    let mut counts = [0usize; 3];
+    for mark in &marks {
+        counts[match mark.colour {
+            overlay::Colour::Settled => 0,
+            overlay::Colour::Cheap => 1,
+            overlay::Colour::Groupable => 2,
+        }] += 1;
+    }
+    println!(
+        "{} frames over {}: {} green (too cheap), {} blue (move to a group tab), {} grey",
+        marks.len(),
+        calibration.stash.w,
+        counts[1],
+        counts[2],
+        counts[0]
+    );
+
+    if args.dry_run {
+        for mark in &marks {
+            println!(
+                "{:>4},{:<4} {}x{} {}",
+                mark.rect.x,
+                mark.rect.y,
+                mark.rect.w,
+                mark.rect.h,
+                mark.colour.label()
+            );
+        }
+        return Ok(());
+    }
+    if marks.is_empty() {
+        bail!("no positioned items for that tab; run `big_oil stash watch` first");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        overlay::wayland::run(calibration.stash, marks)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!("the overlay is only implemented for Wayland")
+    }
 }

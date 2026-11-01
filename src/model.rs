@@ -73,6 +73,8 @@ pub struct Item {
     /// Stash position, so a report can say where to find the item.
     pub x: Option<i64>,
     pub y: Option<i64>,
+    pub w: Option<i64>,
+    pub h: Option<i64>,
     pub icon: Option<String>,
     /// Free text the seller typed; price notes (`~b/o 1 divine`) live here.
     pub note: Option<String>,
@@ -150,6 +152,8 @@ impl Item {
             map_tier: property_number(v, "Map Tier"),
             x: int_field(v, "x"),
             y: int_field(v, "y"),
+            w: int_field(v, "w"),
+            h: int_field(v, "h"),
             icon: str_field(v, "icon"),
             note: str_field(v, "note"),
             mods_text: mods.join("\n"),

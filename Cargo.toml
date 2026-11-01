@@ -15,5 +15,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = { version = "3.5.0", features = ["json", "gzip"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# In-game overlay: layer-shell (overlay layer renders above fullscreen windows).
+smithay-client-toolkit = { version = "0.19.2", default-features = false }
+
 [profile.release]
 lto = "thin"

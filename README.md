@@ -219,6 +219,34 @@ POS    ITEM                                 VALUE  TAB×   LISTINGS  VERDICT
 verdict thresholds. Positions come from the stash response, so they are the
 in-tab coordinates.
 
+## In-game overlay
+
+`big_oil overlay --league Allflame --tab dump` draws a frame around every item
+in the tab, on the compositor's **overlay** layer, so it stays visible over a
+fullscreen game — niri and Hyprland both render only that layer above
+fullscreen windows. The surface has an empty input region, so every click still
+lands in the game.
+
+```
+green  — worth at least --cheap% (default 150%) of its listed price, or an
+         unidentified unique: price it by hand before it sells for the tab price
+blue   — belongs in a specialised tab: gems, currency/cards, flasks,
+         contracts/blueprints, maps
+grey   — settled at this tab's price
+```
+
+Geometry comes from **little_oil's calibration**, so it shares the stash grid
+you already calibrated there:
+
+```sh
+big_oil overlay --league Allflame --tab dump --dry-run   # print frames, draw nothing
+big_oil overlay --league Allflame --tab dump --config ~/.config/little_oil/config.json
+```
+
+The overlay snapshots the index when it starts; re-run it (bind it to a hotkey
+in your compositor) after `stash watch` refreshes. It needs `stash watch` to
+have seen that tab at least once, since item positions come from the stash API.
+
 ## Build
 
 ```sh
@@ -244,6 +272,7 @@ stash      watch | list | value   (your own tabs)
 ninja      fetch                  (poe.ninja economy snapshot)
 dump       Underpriced items and overdue price cuts (--json, --notify)
 extract    Triage a freshly identified tab: what to pull, what is stuck
+overlay    In-game frames around items in the open tab (Wayland)
 ```
 
 Search filters: `--league --name --base --rarity --account --mods --min-ilvl

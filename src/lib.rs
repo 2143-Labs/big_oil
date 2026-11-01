@@ -11,6 +11,7 @@ pub mod dump;
 pub mod extract;
 pub mod model;
 pub mod ninja;
+pub mod overlay;
 pub mod own;
 pub mod price;
 pub mod rates;
