@@ -13,9 +13,11 @@ use std::time::Duration;
 use big_oil::auth;
 use big_oil::client::{self, Client};
 use big_oil::config::Config;
+use big_oil::dump::{self, Settings as DumpSettings};
 use big_oil::model::StashPage;
 use big_oil::ninja::{self, NinjaClient, Overview};
 use big_oil::own::OwnClient;
+use big_oil::rates::Rates;
 use big_oil::render;
 use big_oil::store::{self, Order, SearchQuery, Store};
 
@@ -75,6 +77,8 @@ enum Command {
         #[command(subcommand)]
         cmd: NinjaCommand,
     },
+    /// Underpriced items and overdue price cuts
+    Dump(DumpArgs),
     /// Print config, token and database paths
     Paths,
 }
@@ -158,6 +162,9 @@ struct StashWatch {
     /// Override the endpoint (for tests/proxies)
     #[arg(long)]
     base_url: Option<String>,
+    /// Desktop notification when something needs attention
+    #[arg(long)]
+    notify: bool,
 }
 
 #[derive(Subcommand)]
@@ -178,6 +185,35 @@ enum NinjaCommand {
         #[arg(long)]
         base_url: Option<String>,
     },
+}
+
+#[derive(clap::Args)]
+struct DumpArgs {
+    #[arg(long, env = "BIG_OIL_LEAGUE")]
+    league: String,
+    /// Tab name substring (e.g. your dump tab)
+    #[arg(long)]
+    tab: Option<String>,
+    /// Flag items listed below this percent of market value
+    #[arg(long, default_value_t = 50.0)]
+    underpriced: f64,
+    /// Ignore items worth less than this many chaos
+    #[arg(long, default_value_t = 20.0)]
+    min_value: f64,
+    /// Ignore gaps worth less than this many chaos
+    #[arg(long, default_value_t = 10.0)]
+    min_loss: f64,
+    /// Suggest a cut after this long at the same price
+    #[arg(long, default_value = "12h")]
+    every: String,
+    /// Cut size in percent
+    #[arg(long, default_value_t = 20.0)]
+    cut: f64,
+    #[arg(long)]
+    json: bool,
+    /// Desktop notification with the summary
+    #[arg(long)]
+    notify: bool,
 }
 
 #[derive(clap::Args)]
@@ -262,6 +298,7 @@ fn run() -> Result<()> {
                 base_url,
             } => ninja_fetch_cmd(&cfg, &league, types, all, no_currency, base_url),
         },
+        Command::Dump(args) => run_dump(&cfg, args),
         Command::Paths => {
             for (name, path) in cfg.layout() {
                 println!("{name:<9} {path}");
@@ -881,7 +918,10 @@ fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
         }
 
         match stash_pass(&mut store, &client, &account, &args, filter.as_deref()) {
-            Ok(drops) => print_drops(&drops),
+            Ok(drops) => {
+                print_drops(&drops);
+                alert_dump(&store, &args.league, args.notify);
+            }
             Err(e) if args.once => return Err(e),
             Err(e) => tracing::warn!(error = %e, interval = args.interval, "pass failed"),
         }
@@ -1025,4 +1065,202 @@ fn stash_value(cfg: &Config, league: &str) -> Result<()> {
     let n = store.value_items(league)?;
     println!("valued {n} own items in {league}");
     Ok(())
+}
+
+fn dump_settings(args: &DumpArgs) -> Result<DumpSettings> {
+    let cut_after_secs = render::parse_duration(&args.every)
+        .with_context(|| format!("--every {:?} is not a duration like 12h or 1d", args.every))?;
+    Ok(DumpSettings {
+        tab: args.tab.clone(),
+        underprice_ratio: (args.underpriced / 100.0).clamp(0.01, 1.0),
+        min_value_chaos: args.min_value.max(0.0),
+        min_loss_chaos: args.min_loss.max(0.0),
+        cut_after_secs,
+        cut_pct: args.cut.clamp(0.0, 95.0),
+    })
+}
+
+fn build_report(store: &Store, league: &str, settings: &DumpSettings) -> Result<dump::Report> {
+    let lines = store.price_lines(league)?;
+    if lines.is_empty() {
+        bail!("no price snapshot for {league}: run `big_oil ninja fetch --league {league}` first");
+    }
+    let rates = Rates::from_lines(&lines);
+    let rows = store.search(&SearchQuery {
+        source: Some("own".into()),
+        limit: 100_000,
+        ..Default::default()
+    })?;
+    Ok(dump::analyze(&rows, &rates, store::unix_now(), settings))
+}
+
+fn run_dump(cfg: &Config, args: DumpArgs) -> Result<()> {
+    let settings = dump_settings(&args)?;
+    let store = open_store(cfg)?;
+    let report = build_report(&store, &args.league, &settings)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        if let Some(at) = store.priced_at(&args.league)? {
+            println!(
+                "market values from {} ({} old)",
+                render::ts(at),
+                render::age(at)
+            );
+            println!();
+        }
+        print_report(&report, &settings);
+    }
+    if args.notify {
+        notify_user(&report.summary());
+    }
+    Ok(())
+}
+
+fn print_report(report: &dump::Report, settings: &DumpSettings) {
+    if report.is_quiet() {
+        println!("nothing to do: no underpriced or stale listings");
+        return;
+    }
+
+    if !report.underpriced.is_empty() {
+        println!(
+            "UNDERPRICED — listed below {}% of market",
+            (settings.underprice_ratio * 100.0).round() as i64
+        );
+        let body: Vec<Vec<String>> = report
+            .underpriced
+            .iter()
+            .map(|f| {
+                vec![
+                    f.name.clone(),
+                    f.tab.clone().unwrap_or_default(),
+                    f.listed.clone().unwrap_or_else(|| "-".into()),
+                    f.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
+                    f.loss_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
+                    fmt_duration(f.age_secs),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            render::table(
+                &["item", "tab", "listed", "value", "missing", "for"],
+                &body,
+                42
+            )
+        );
+        println!(
+            "value at risk: {} if these sell as listed",
+            chaos_cell(report.value_at_risk)
+        );
+    }
+
+    if !report.unpriced.is_empty() {
+        if !report.underpriced.is_empty() {
+            println!();
+        }
+        println!("NO PRICE — worth pricing");
+        let body: Vec<Vec<String>> = report
+            .unpriced
+            .iter()
+            .map(|f| {
+                vec![
+                    f.name.clone(),
+                    f.tab.clone().unwrap_or_default(),
+                    f.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
+                    fmt_duration(f.age_secs),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            render::table(&["item", "tab", "value", "for"], &body, 42)
+        );
+    }
+
+    if !report.due.is_empty() {
+        if !report.underpriced.is_empty() || !report.unpriced.is_empty() {
+            println!();
+        }
+        println!(
+            "DUE FOR A CUT — unchanged for {}h, cut {}%",
+            settings.cut_after_secs / 3600,
+            settings.cut_pct.round() as i64
+        );
+        let body: Vec<Vec<String>> = report
+            .due
+            .iter()
+            .map(|f| {
+                vec![
+                    f.name.clone(),
+                    f.tab.clone().unwrap_or_default(),
+                    f.listed.clone().unwrap_or_else(|| "-".into()),
+                    f.suggested.clone().unwrap_or_else(|| "-".into()),
+                    fmt_duration(f.age_secs),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            render::table(&["item", "tab", "now", "cut to", "for"], &body, 42)
+        );
+    }
+
+    println!("\n{}", report.summary());
+}
+
+/// Called after each stash pass so the reminder is impossible to miss.
+fn alert_dump(store: &Store, league: &str, notify: bool) {
+    let lines = match store.price_lines(league) {
+        Ok(lines) if !lines.is_empty() => lines,
+        _ => return,
+    };
+    let rates = Rates::from_lines(&lines);
+    let rows = match store.search(&SearchQuery {
+        source: Some("own".into()),
+        limit: 100_000,
+        ..Default::default()
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "dump check failed");
+            return;
+        }
+    };
+    let report = dump::analyze(&rows, &rates, store::unix_now(), &DumpSettings::default());
+    if report.is_quiet() {
+        return;
+    }
+    println!("dump: {}", report.summary());
+    if notify {
+        notify_user(&report.summary());
+    }
+}
+
+fn notify_user(summary: &str) {
+    match std::process::Command::new("notify-send")
+        .args(["-u", "critical", "-a", "big_oil", "Dump tab", summary])
+        .status()
+    {
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "notify-send unavailable"),
+    }
+}
+
+fn chaos_cell(value: f64) -> String {
+    format!("{}c", trim_num(value))
+}
+
+fn fmt_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }

@@ -214,7 +214,7 @@ pub struct IngestStats {
     pub unlisted_stashes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct ItemRow {
     pub id: String,
     pub stash_id: String,
@@ -241,6 +241,9 @@ pub struct ItemRow {
     pub first_seen: i64,
     pub last_seen: i64,
     pub delisted_at: Option<i64>,
+    /// When the item first appeared or last changed price — the dump-tab decay
+    /// clock. Movement between tabs does not reset it.
+    pub price_since: Option<i64>,
 }
 
 impl ItemRow {
@@ -939,7 +942,12 @@ const ITEM_SELECT: &str =
     "SELECT i.id, i.stash_id, s.name, i.account, i.league, i.name, i.type_line,
         i.base_type, i.rarity, i.ilvl, i.stack_size, i.sockets, i.links, i.corrupted, i.note,
         i.price_amount, i.price_currency, i.price_type, i.source, i.value_chaos, i.value_divine,
-        i.valued_at, i.first_seen, i.last_seen, i.delisted_at
+        i.valued_at, i.first_seen, i.last_seen, i.delisted_at,
+        COALESCE(
+            (SELECT MAX(l.at) FROM listings l WHERE l.item_id = i.id AND l.event = 'price_changed'),
+            (SELECT MIN(l.at) FROM listings l WHERE l.item_id = i.id AND l.event IN ('listed', 'dropped')),
+            i.first_seen
+        )
     FROM items i LEFT JOIN stashes s ON s.id = i.stash_id";
 
 fn item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
@@ -969,6 +977,7 @@ fn item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
         first_seen: r.get(22)?,
         last_seen: r.get(23)?,
         delisted_at: r.get(24)?,
+        price_since: r.get(25)?,
     })
 }
 

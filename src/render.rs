@@ -75,19 +75,23 @@ pub fn table(headers: &[&str], rows: &[Vec<String>], max: usize) -> String {
     out
 }
 
-/// `30m`, `6h`, `7d`, or an absolute unix timestamp.
-pub fn parse_since(raw: &str) -> Option<i64> {
+/// `30m`, `6h`, `7d` as a duration in seconds.
+pub fn parse_duration(raw: &str) -> Option<i64> {
     let raw = raw.trim();
     let (value, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit())?);
     let value: i64 = value.parse().ok()?;
-    let secs = match unit {
+    Some(match unit {
         "s" => value,
         "m" => value * 60,
         "h" => value * 3600,
         "d" => value * 86_400,
         _ => return None,
-    };
-    Some(crate::store::unix_now() - secs)
+    })
+}
+
+/// A duration back-dated from now (for `--since`).
+pub fn parse_since(raw: &str) -> Option<i64> {
+    parse_duration(raw).map(|secs| crate::store::unix_now() - secs)
 }
 
 #[cfg(test)]

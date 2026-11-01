@@ -113,6 +113,58 @@ data updates roughly every 15 minutes, so `stash watch` refreshes every
 `--price-interval` seconds (default 1800) using conditional requests. The default
 category set is ~3 MB; `--all` adds gems and base types (~6 MB more).
 
+## Underpricing and price decay
+
+The two ways a dump tab loses money, computed from the notes you typed against
+the poe.ninja snapshot:
+
+```sh
+big_oil dump --league Allflame
+big_oil dump --league Allflame --tab dump --underpriced 50 --every 12h --cut 20
+big_oil stash watch --league Allflame --notify     # alert after every pass
+```
+
+```
+market values from 2026-11-01T02:22:01Z (55s old)
+
+UNDERPRICED — listed below 50% of market
+ITEM                       TAB   LISTED    VALUE  MISSING  FOR
+Headhunter (Leather Belt)  Dump  1 divine  4542c  4222c    49s
+value at risk: 4222c if these sell as listed
+
+NO PRICE — worth pricing
+ITEM                    TAB   VALUE    FOR
+Mageblood (Heavy Belt)  Dump  488265c  49s
+
+DUE FOR A CUT — unchanged for 12h, cut 20%
+ITEM             TAB   NOW        CUT TO     FOR
+Chaos Orb        Dump  500 chaos  400 chaos  13h
+```
+
+- **UNDERPRICED** — listed below `--underpriced` percent of market, worth at
+  least `--min-value` chaos, missing at least `--min-loss` chaos. Sorted by
+  value at risk.
+- **NO PRICE** — valuable items with no note at all (the other way to leave
+  money on the table).
+- **DUE FOR A CUT** — priced items unchanged for `--every`, with the suggested
+  price (`current × (1 - cut%)`, rounded to whole chaos or one decimal).
+  Underpriced items are never suggested for a further cut.
+
+Notes are converted to chaos using the currency overview, including the short
+forms people type (`divine`, `alch`, `exalt`, `mirror`, `fuse`, `alt`, …).
+
+The decay clock is the item's own price history: the next stash pass sees your
+new note as a `price_changed` event, so the reminder clears itself once you
+re-price. Moving an item between tabs does **not** restart it.
+
+Limits to keep in mind: poe.ninja prices types, not instances, so rares (and
+uniques with indistinguishable variants) can only ever appear under DUE FOR A
+CUT, and a stale snapshot (shown at the top of the report) means stale values —
+`stash watch` refreshes every 30 minutes by default.
+
+`--notify` shells out to `notify-send -u critical` for the summary line, from
+both `dump` and `stash watch`.
+
 ## Build
 
 ```sh
@@ -136,6 +188,7 @@ stats      Index summary (--json)
 paths      Config, token and database locations
 stash      watch | list | value   (your own tabs)
 ninja      fetch                  (poe.ninja economy snapshot)
+dump       Underpriced items and overdue price cuts (--json, --notify)
 ```
 
 Search filters: `--league --name --base --rarity --account --mods --min-ilvl

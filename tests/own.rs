@@ -313,3 +313,63 @@ fn client_sends_session_cookie_and_tab_params() {
     assert!(requests[1].contains("tabs=0&tabIndex=0"));
     assert!(requests[0].contains("cookie: POESESSID=session-cookie-value"));
 }
+
+#[test]
+fn decay_clock_follows_price_changes_not_moves() {
+    let mut store = Store::open_memory().unwrap();
+    store
+        .ingest_own_tab(
+            "tab-a",
+            "Dump",
+            "PremiumStash",
+            "Standard",
+            Some("Tester#1"),
+            &[headhunter()],
+        )
+        .unwrap();
+    let first = store.item("h1").unwrap().unwrap().price_since.unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Move the belt to another tab: it leaves one snapshot and appears in the
+    // next, but that is not a price change.
+    store
+        .ingest_own_tab(
+            "tab-a",
+            "Dump",
+            "PremiumStash",
+            "Standard",
+            Some("Tester#1"),
+            &[],
+        )
+        .unwrap();
+    store
+        .ingest_own_tab(
+            "tab-b",
+            "Sale",
+            "PremiumStash",
+            "Standard",
+            Some("Tester#1"),
+            &[headhunter()],
+        )
+        .unwrap();
+    let moved = store.item("h1").unwrap().unwrap().price_since.unwrap();
+    assert_eq!(moved, first, "moving tabs must not restart the decay clock");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let mut priced = headhunter();
+    priced.note = Some("~b/o 50 chaos".into());
+    store
+        .ingest_own_tab(
+            "tab-b",
+            "Sale",
+            "PremiumStash",
+            "Standard",
+            Some("Tester#1"),
+            &[priced],
+        )
+        .unwrap();
+    let changed = store.item("h1").unwrap().unwrap().price_since.unwrap();
+    assert!(changed > first, "a price change restarts the clock");
+}
