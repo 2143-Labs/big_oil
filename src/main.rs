@@ -144,12 +144,15 @@ struct StashWatch {
     /// One pass, then exit
     #[arg(long)]
     once: bool,
-    /// Seconds between passes
-    #[arg(long, default_value_t = 120)]
+    /// Seconds between passes (each pass re-reads every scanned tab)
+    #[arg(long, default_value_t = 300)]
     interval: u64,
     /// Comma-separated tab indexes to scan (default: every visible tab)
     #[arg(long)]
     tabs: Option<String>,
+    /// Only tabs whose name contains this text (e.g. your dump tab)
+    #[arg(long)]
+    tab_name: Option<String>,
     /// Refresh poe.ninja prices before the first pass
     #[arg(long)]
     refresh_prices: bool,
@@ -951,6 +954,14 @@ fn stash_pass(
         }
         if let Some(filter) = filter
             && !filter.contains(&tab.index)
+        {
+            continue;
+        }
+        if let Some(name) = &args.tab_name
+            && !tab
+                .name
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
         {
             continue;
         }

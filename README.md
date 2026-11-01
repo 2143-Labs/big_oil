@@ -74,9 +74,9 @@ big_oil stash list                             # per-tab item counts and value
 big_oil search --source own --limit 20         # your items, with a VALUE column
 ```
 
-`stash watch` reads the tab list once, then each visible tab, diffs item ids
-against what it recorded (`dropped` / `removed` events), and attaches a
-poe.ninja estimate. New items are printed as they appear, so leaving it running
+`stash watch` reads the tab list once, then each visible tab (every 5 minutes by
+default, `--tab-name dump` to scan just one), diffs item ids against what it
+recorded (`dropped` / `removed` events), and attaches a poe.ninja estimate. New items are printed as they appear, so leaving it running
 next to the game gives you a priced drop feed.
 
 Credentials, only needed for this feature:
@@ -121,7 +121,7 @@ the poe.ninja snapshot:
 ```sh
 big_oil dump --league Allflame
 big_oil dump --league Allflame --tab dump --underpriced 50 --every 12h --cut 20
-big_oil stash watch --league Allflame --notify     # alert after every pass
+big_oil stash watch --league Allflame --tab-name dump --notify   # alert each pass
 ```
 
 ```
