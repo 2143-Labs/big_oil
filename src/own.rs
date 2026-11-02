@@ -210,6 +210,8 @@ fn api_error(value: &Value) -> Option<anyhow::Error> {
     })
 }
 
+/// The account's tab list. A response without a `tabs` array is an error, never
+/// an empty account: an empty list would close every tab.
 pub fn parse_tab_list(value: &Value) -> Result<TabList> {
     if let Some(err) = api_error(value) {
         return Err(err);
@@ -218,30 +220,29 @@ pub fn parse_tab_list(value: &Value) -> Result<TabList> {
     let tabs = value
         .get("tabs")
         .and_then(Value::as_array)
-        .map(|tabs| {
-            tabs.iter()
-                .enumerate()
-                .map(|(fallback, tab)| TabInfo {
-                    index: tab
-                        .get("i")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(fallback as i64),
-                    name: tab
-                        .get("n")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    kind: tab
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    id: tab.get("id").and_then(Value::as_str).map(str::to_owned),
-                    hidden: tab.get("hidden").and_then(Value::as_bool).unwrap_or(false),
-                })
-                .collect()
+        .context("stash response has no tabs list")?;
+    let tabs = tabs
+        .iter()
+        .enumerate()
+        .map(|(fallback, tab)| TabInfo {
+            index: tab
+                .get("i")
+                .and_then(Value::as_i64)
+                .unwrap_or(fallback as i64),
+            name: tab
+                .get("n")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            kind: tab
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            id: tab.get("id").and_then(Value::as_str).map(str::to_owned),
+            hidden: tab.get("hidden").and_then(Value::as_bool).unwrap_or(false),
         })
-        .unwrap_or_default();
+        .collect();
     Ok(TabList {
         num_tabs,
         tabs,
@@ -295,9 +296,13 @@ pub fn scan(
         ..Default::default()
     };
 
-    // "Missing" means absent from the account, not unselected or hidden.
-    let present: HashSet<String> = list.tabs.iter().map(|t| t.stash_id(league)).collect();
-    report.closed_tabs = store.close_missing_own_tabs(league, &present)?;
+    // "Missing" means absent from the account, not unselected or hidden. Every
+    // account has tabs, so an empty list is a bad response, not a reason to
+    // close them all.
+    if !list.tabs.is_empty() {
+        let present: HashSet<String> = list.tabs.iter().map(|t| t.stash_id(league)).collect();
+        report.closed_tabs = store.close_missing_own_tabs(league, &present)?;
+    }
 
     let visible: Vec<&TabInfo> = list.tabs.iter().filter(|t| !t.hidden).collect();
     let selected: Vec<&TabInfo> = visible
@@ -414,6 +419,9 @@ mod tests {
         let err = parse_items(&json!({"numTabs": 3})).unwrap_err();
         assert!(err.to_string().contains("no items array"));
         assert!(parse_items(&json!({"items": []})).unwrap().is_empty());
+
+        let err = parse_tab_list(&json!({"numTabs": 3, "items": []})).unwrap_err();
+        assert!(err.to_string().contains("no tabs list"));
     }
 
     #[test]
