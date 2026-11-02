@@ -21,7 +21,6 @@ use big_oil::model::StashPage;
 use big_oil::ninja::{self, NinjaClient, Overview};
 use big_oil::overlay::{self, Calibration};
 use big_oil::own::{self, OwnClient, SessionExpired};
-use big_oil::rates::Rates;
 use big_oil::render;
 use big_oil::store::{self, Order, SearchQuery, Store};
 
@@ -1461,17 +1460,19 @@ fn print_extract(report: &extract::Report) {
 
 fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
     let store = open_own(cfg)?;
-    let lines = store.price_lines(&args.league)?;
-    if lines.is_empty() {
-        tracing::warn!(
-            "no price snapshot for {}; every item will be drawn grey. Run `big_oil ninja fetch --league {}`",
-            args.league,
-            args.league
-        );
-    }
-    let rates = Rates::from_lines(&lines);
+    let rates = store.rates(&args.league)?;
     let rows = store.own_rows(&args.league)?;
     let tab_rows = listing::resolve_one(&rows, &TabSelector::parse(&args.tab)?)?;
+    let first = tab_rows[0];
+    let tab = render::clean(&listing::tab_label(first));
+
+    let stash_type = first.stash_type.clone().unwrap_or_default();
+    let Some(scale) = overlay::grid_scale(&stash_type) else {
+        bail!(
+            "tab type {stash_type} has no item grid the overlay can draw \
+             (supported: NormalStash, PremiumStash, QuadStash)"
+        );
+    };
 
     let path = match args.config.clone() {
         Some(path) => path,
@@ -1479,7 +1480,18 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
     };
     let calibration = Calibration::from_little_oil(&path)?;
 
-    let marks = overlay::marks(&tab_rows, &rates, &calibration, &args.rule.rule());
+    let marks = overlay::marks(&tab_rows, &rates, &calibration, &args.rule.rule(), scale);
+
+    if let Some(seen) = first.stash_last_seen {
+        let age = store::unix_now() - seen;
+        if age > 900 {
+            eprintln!(
+                "warning: {tab} was last scanned {} ago; `big_oil stash watch` refreshes it",
+                render::duration(age)
+            );
+        }
+    }
+
     let mut counts = [0usize; 3];
     for mark in &marks {
         counts[match mark.colour {
@@ -1489,9 +1501,8 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
         }] += 1;
     }
     println!(
-        "{} frames on {}: {} green (underpriced), {} blue (move to a group tab), {} grey",
+        "{} frames on {tab}: {} green (underpriced), {} blue (move to a group tab), {} grey",
         marks.len(),
-        render::clean(&listing::tab_label(tab_rows[0])),
         counts[1],
         counts[2],
         counts[0]
@@ -1510,13 +1521,17 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
         }
         return Ok(());
     }
-    if marks.is_empty() {
-        bail!("no positioned items for that tab; run `big_oil stash watch` first");
-    }
 
     #[cfg(target_os = "linux")]
     {
-        overlay::wayland::run(calibration.stash, marks)
+        // Running it again closes the overlay already on screen.
+        let Some(_pid_file) = overlay::toggle_previous()? else {
+            return Ok(());
+        };
+        if marks.is_empty() {
+            bail!("no positioned items for that tab; run `big_oil stash watch` first");
+        }
+        overlay::wayland::run(calibration.surface, marks)
     }
     #[cfg(not(target_os = "linux"))]
     {

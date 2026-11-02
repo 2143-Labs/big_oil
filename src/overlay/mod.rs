@@ -8,8 +8,11 @@
 //!   contracts, maps)
 //! * grey   — settled: the tab price is fine
 //!
-//! Geometry comes from little_oil's stash calibration (region + per-column and
-//! per-row edges), and item positions come from the stash API (`x`/`y`/`w`/`h`).
+//! Geometry comes from little_oil's quad-tab calibration: per-column and
+//! per-row edges in frame space (relative to its `game_window_region`). A
+//! normal or premium tab is a 12×12 grid over the same area, so each of its
+//! cells spans two quad cells. Item positions come from the stash API
+//! (`x`/`y`/`w`/`h`).
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -67,19 +70,24 @@ pub struct Mark {
 
 #[derive(Debug, Clone)]
 pub struct Calibration {
-    /// The stash grid on screen (top-left of the first cell).
-    pub stash: Rect,
+    /// Where the overlay surface goes on screen (little_oil's `stash_region`).
+    pub surface: Rect,
+    /// Screen position of the frame the grid is measured in (little_oil's
+    /// `game_window_region` x, y).
+    pub origin: (i32, i32),
     pub cell_w: u32,
     pub cell_h: u32,
-    /// Left edge of each column, relative to `stash.x`.
+    /// Left edge of each of the 24 quad columns, in frame space.
     pub cols: Vec<u32>,
-    /// Top edge of each row, relative to `stash.y`.
+    /// Top edge of each of the 24 quad rows, in frame space.
     pub rows: Vec<u32>,
 }
 
+/// little_oil always calibrates the 24×24 quad grid.
+const QUAD: usize = 24;
+
 impl Calibration {
-    /// Read little_oil's calibration (`stash_region` + `stash_grid`), so both
-    /// tools agree on where the grid is.
+    /// Read little_oil's calibration, so both tools agree on where the grid is.
     pub fn from_little_oil(path: &Path) -> Result<Calibration> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading little_oil config {}", path.display()))?;
@@ -88,23 +96,27 @@ impl Calibration {
         let region = config
             .stash_region
             .context("little_oil config has no stash_region — run `little_oil set-region stash`")?;
+        let window = config.game_window_region.context(
+            "little_oil config has no game_window_region — run `little_oil set-region window`",
+        )?;
         let grid = config
             .stash_grid
             .context("little_oil config has no stash_grid — run `little_oil calibrate-stash`")?;
-        if grid.cols.len() < 2 || grid.rows.len() < 2 {
+        if grid.cols.len() != QUAD || grid.rows.len() != QUAD {
             bail!(
-                "little_oil stash_grid is incomplete ({} cols, {} rows)",
+                "little_oil stash_grid has {}x{} cells; expected the 24x24 quad calibration",
                 grid.cols.len(),
                 grid.rows.len()
             );
         }
         Ok(Calibration {
-            stash: Rect {
+            surface: Rect {
                 x: region.x,
                 y: region.y,
                 w: region.width,
                 h: region.height,
             },
+            origin: (window.x, window.y),
             cell_w: grid.cell_w,
             cell_h: grid.cell_h,
             cols: grid.cols,
@@ -120,38 +132,106 @@ impl Calibration {
             )
     }
 
-    /// Screen rectangle of an item occupying `w`×`h` cells at `(x, y)`.
-    pub fn cell_rect(&self, x: i64, y: i64, w: i64, h: i64) -> Option<Rect> {
-        if x < 0 || y < 0 || w <= 0 || h <= 0 {
+    /// Screen rectangle of an item occupying `w`×`h` cells at `(x, y)` in a tab
+    /// whose cells span `scale` quad cells (see [`grid_scale`]).
+    pub fn cell_rect(&self, x: i64, y: i64, w: i64, h: i64, scale: usize) -> Option<Rect> {
+        if x < 0 || y < 0 || w <= 0 || h <= 0 || scale == 0 {
             return None;
         }
-        let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
-        let left = *self.cols.get(x)?;
-        let top = *self.rows.get(y)?;
-        // Last cell's far edge, so multi-cell items span the grid correctly.
-        let right = match self.cols.get(x + w) {
+        let (x0, y0) = (x as usize * scale, y as usize * scale);
+        let (x1, y1) = ((x + w) as usize * scale, (y + h) as usize * scale);
+        let left = *self.cols.get(x0)?;
+        let top = *self.rows.get(y0)?;
+        // The far edge is the next cell's start, or the last cell's start plus
+        // a cell at the grid's edge.
+        let right = match self.cols.get(x1) {
             Some(next) => *next,
-            None => *self.cols.get(x + w - 1)? + self.cell_w,
+            None => *self.cols.get(x1 - 1)? + self.cell_w,
         };
-        let bottom = match self.rows.get(y + h) {
+        let bottom = match self.rows.get(y1) {
             Some(next) => *next,
-            None => *self.rows.get(y + h - 1)? + self.cell_h,
+            None => *self.rows.get(y1 - 1)? + self.cell_h,
         };
         Some(Rect {
-            x: self.stash.x + left as i32,
-            y: self.stash.y + top as i32,
+            x: self.origin.0 + left as i32,
+            y: self.origin.1 + top as i32,
             w: right.saturating_sub(left),
             h: bottom.saturating_sub(top),
         })
     }
 }
 
+/// Quad cells per tab cell: 1 for a quad tab, 2 for a normal or premium tab.
+/// Other tab types (currency, maps, …) have no plain grid to draw on.
+pub fn grid_scale(stash_type: &str) -> Option<usize> {
+    match stash_type {
+        "QuadStash" => Some(1),
+        "NormalStash" | "PremiumStash" => Some(2),
+        _ => None,
+    }
+}
+
+/// Removes the pid file when the overlay exits on its own.
+#[cfg(target_os = "linux")]
+pub struct PidFile(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Running the overlay again closes the one already on screen (a hotkey
+/// toggles it) instead of stacking another surface. `None` means a running
+/// overlay was closed and nothing should be drawn.
+#[cfg(target_os = "linux")]
+pub fn toggle_previous() -> Result<Option<PidFile>> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("big_oil-overlay.pid");
+    let me = std::process::id();
+    if let Ok(raw) = std::fs::read_to_string(&path)
+        && let Ok(pid) = raw.trim().parse::<u32>()
+        && pid != me
+        && std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|comm| comm.trim() == "big_oil")
+    {
+        let status = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .context("running kill")?;
+        if !status.success() {
+            bail!("could not stop the running overlay (pid {pid})");
+        }
+        let _ = std::fs::remove_file(&path);
+        println!("overlay closed");
+        return Ok(None);
+    }
+    std::fs::write(&path, me.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(PidFile(path)))
+}
+
 /// Frames for every item that has a position on the grid.
-pub fn marks(rows: &[&ItemRow], rates: &Rates, cal: &Calibration, rule: &Rule) -> Vec<Mark> {
+pub fn marks(
+    rows: &[&ItemRow],
+    rates: &Rates,
+    cal: &Calibration,
+    rule: &Rule,
+    scale: usize,
+) -> Vec<Mark> {
     rows.iter()
         .filter(|row| row.delisted_at.is_none())
         .filter_map(|row| {
-            let rect = cal.cell_rect(row.x?, row.y?, row.w.unwrap_or(1), row.h.unwrap_or(1))?;
+            let rect = cal.cell_rect(
+                row.x?,
+                row.y?,
+                row.w.unwrap_or(1),
+                row.h.unwrap_or(1),
+                scale,
+            )?;
             Some(Mark {
                 rect,
                 colour: classify(row, rates, rule),
@@ -194,6 +274,7 @@ pub fn is_groupable(row: &ItemRow) -> bool {
 #[derive(Deserialize)]
 struct LittleOil {
     stash_region: Option<RegionJson>,
+    game_window_region: Option<RegionJson>,
     stash_grid: Option<GridJson>,
 }
 
@@ -219,16 +300,17 @@ mod tests {
 
     fn cal() -> Calibration {
         Calibration {
-            stash: Rect {
-                x: 100,
-                y: 200,
-                w: 330,
-                h: 340,
+            surface: Rect {
+                x: 20,
+                y: 30,
+                w: 820,
+                h: 820,
             },
+            origin: (10, 20),
             cell_w: 33,
             cell_h: 34,
-            cols: (0..12).map(|i| i * 33).collect(),
-            rows: (0..12).map(|i| i * 34).collect(),
+            cols: (0..24).map(|i| i * 33).collect(),
+            rows: (0..24).map(|i| i * 34).collect(),
         }
     }
 
@@ -246,34 +328,56 @@ mod tests {
     }
 
     #[test]
-    fn maps_grid_cells_to_screen() {
-        let rect = cal().cell_rect(2, 3, 1, 1).unwrap();
+    fn quad_cells_map_from_the_game_window() {
         assert_eq!(
-            rect,
-            Rect {
-                x: 100 + 66,
-                y: 200 + 102,
+            cal().cell_rect(2, 3, 1, 1, 1),
+            Some(Rect {
+                x: 76,
+                y: 122,
                 w: 33,
                 h: 34
-            }
+            })
         );
     }
 
     #[test]
-    fn multi_cell_items_span_the_grid() {
-        // A 2x3 armour piece starting at (1,1).
-        let rect = cal().cell_rect(1, 1, 2, 3).unwrap();
-        assert_eq!(rect.x, 133);
-        assert_eq!(rect.y, 234);
-        assert_eq!(rect.w, 66);
-        assert_eq!(rect.h, 102);
+    fn premium_cells_span_two_quad_cells() {
+        // A 2x3 armour piece at (1,1) in a 12x12 tab.
+        assert_eq!(
+            cal().cell_rect(1, 1, 2, 3, 2),
+            Some(Rect {
+                x: 76,
+                y: 88,
+                w: 132,
+                h: 204
+            })
+        );
+        // The last premium cell ends at the grid's far edge.
+        assert_eq!(
+            cal().cell_rect(11, 11, 1, 1, 2),
+            Some(Rect {
+                x: 10 + 22 * 33,
+                y: 20 + 22 * 34,
+                w: 66,
+                h: 68
+            })
+        );
     }
 
     #[test]
     fn out_of_range_positions_are_ignored() {
-        assert!(cal().cell_rect(99, 0, 1, 1).is_none());
-        assert!(cal().cell_rect(0, 99, 1, 1).is_none());
-        assert!(cal().cell_rect(-1, 0, 1, 1).is_none());
+        assert!(cal().cell_rect(24, 0, 1, 1, 1).is_none());
+        assert!(cal().cell_rect(0, 24, 1, 1, 1).is_none());
+        assert!(cal().cell_rect(12, 0, 1, 1, 2).is_none());
+        assert!(cal().cell_rect(-1, 0, 1, 1, 1).is_none());
+    }
+
+    #[test]
+    fn grid_scale_knows_the_plain_grids() {
+        assert_eq!(grid_scale("QuadStash"), Some(1));
+        assert_eq!(grid_scale("PremiumStash"), Some(2));
+        assert_eq!(grid_scale("NormalStash"), Some(2));
+        assert_eq!(grid_scale("CurrencyStash"), None);
     }
 
     #[test]
@@ -346,8 +450,8 @@ mod tests {
         let mut placed = row("Placed");
         placed.y = Some(4);
         let rates = Rates::from_lines(&[]);
-        let marks = marks(&[&hidden, &placed], &rates, &cal(), &Rule::default());
+        let marks = marks(&[&hidden, &placed], &rates, &cal(), &Rule::default(), 1);
         assert_eq!(marks.len(), 1);
-        assert_eq!(marks[0].rect.y, 200 + 136);
+        assert_eq!(marks[0].rect.y, 20 + 4 * 34);
     }
 }

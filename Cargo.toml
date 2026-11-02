@@ -18,7 +18,7 @@ ureq = { version = "3.5.0", features = ["gzip"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # In-game overlay: layer-shell (overlay layer renders above fullscreen windows).
-smithay-client-toolkit = { version = "0.19.2", default-features = false }
+smithay-client-toolkit = { version = "0.21.1", default-features = false }
 
 [profile.release]
 lto = "thin"

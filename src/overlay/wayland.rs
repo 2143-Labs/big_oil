@@ -13,7 +13,7 @@ use smithay_client_toolkit::reexports::client::{
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -76,10 +76,12 @@ pub fn run(area: Rect, marks: Vec<Mark>) -> Result<()> {
         surface,
         Layer::Overlay,
         Some("big_oil"),
-        output.as_ref(),
+        output.as_ref().map(|(o, _)| o),
     );
     layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-    layer.set_margin(area.y, 0, 0, area.x);
+    // Layer-shell margins are relative to the output, not the desktop.
+    let (top, left) = margins(area, output.as_ref().map(|(_, origin)| *origin));
+    layer.set_margin(top, 0, 0, left);
     layer.set_size(area.w, area.h);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.set_exclusive_zone(-1);
@@ -98,19 +100,23 @@ pub fn run(area: Rect, marks: Vec<Mark>) -> Result<()> {
     Ok(())
 }
 
-fn pick_output(outputs: &OutputState, area: Rect) -> Option<wl_output::WlOutput> {
+/// The output containing the area's top-left corner, with its logical
+/// position on the desktop.
+fn pick_output(outputs: &OutputState, area: Rect) -> Option<(wl_output::WlOutput, (i32, i32))> {
     let (x, y) = (area.x, area.y);
-    outputs.outputs().into_iter().find(|output| {
-        outputs.info(output).is_some_and(|info| {
-            let Some((ox, oy)) = info.logical_position else {
-                return false;
-            };
-            let Some((ow, oh)) = info.logical_size else {
-                return false;
-            };
-            x >= ox && x < ox + ow && y >= oy && y < oy + oh
-        })
+    outputs.outputs().into_iter().find_map(|output| {
+        let info = outputs.info(&output)?;
+        let (ox, oy) = info.logical_position?;
+        let (ow, oh) = info.logical_size?;
+        (x >= ox && x < ox + ow && y >= oy && y < oy + oh).then_some((output, (ox, oy)))
     })
+}
+
+/// `(top, left)` layer margins placing `area` (desktop coordinates) on an
+/// output whose top-left is `output_origin`.
+fn margins(area: Rect, output_origin: Option<(i32, i32)>) -> (i32, i32) {
+    let (ox, oy) = output_origin.unwrap_or((0, 0));
+    (area.y - oy, area.x - ox)
 }
 
 struct Overlay {
@@ -293,8 +299,22 @@ impl ProvidesRegistryState for Overlay {
     registry_handlers![OutputState];
 }
 
-delegate_compositor!(Overlay);
-delegate_output!(Overlay);
-delegate_shm!(Overlay);
-delegate_layer!(Overlay);
 delegate_registry!(Overlay);
+smithay_client_toolkit::delegate_dispatch2!(Overlay);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn margins_are_relative_to_the_output() {
+        let area = Rect {
+            x: 2600,
+            y: 300,
+            w: 800,
+            h: 800,
+        };
+        assert_eq!(margins(area, Some((2560, 0))), (300, 40));
+        assert_eq!(margins(area, None), (300, 2600));
+    }
+}
