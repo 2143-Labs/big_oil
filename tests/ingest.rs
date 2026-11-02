@@ -1,6 +1,6 @@
-//! End-to-end tests over the ingest/diff/query pipeline, using one real
-//! public-stash page (item JSON captured from the live API) and mutations of it
-//! to reproduce the events the stream emits.
+//! End-to-end tests over the ingest/diff/query pipeline, using one synthetic
+//! public-stash page (in the live API's shape) and mutations of it to reproduce
+//! the events the stream emits.
 
 use big_oil::model::StashPage;
 use big_oil::store::{Order, SearchQuery, Store};
