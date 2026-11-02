@@ -15,6 +15,7 @@ use big_oil::client::{self, Client};
 use big_oil::config::Config;
 use big_oil::dump::{self, Settings as DumpSettings};
 use big_oil::extract::{self, Settings as ExtractSettings};
+use big_oil::listing::{self, Rule, TabSelector};
 use big_oil::model::StashPage;
 use big_oil::ninja::{self, NinjaClient, Overview};
 use big_oil::overlay::{self, Calibration};
@@ -119,7 +120,7 @@ enum Command {
         #[command(subcommand)]
         cmd: NinjaCommand,
     },
-    /// Underpriced items and overdue price cuts
+    /// Underpriced items per tab, and how long each tab has sat at its price
     Dump(DumpArgs),
     /// Triage a freshly identified tab: what to pull, what is stuck
     Extract(ExtractArgs),
@@ -236,32 +237,35 @@ enum NinjaCommand {
     },
 }
 
+/// The shared underpriced rule (see `listing::Rule`).
+#[derive(clap::Args)]
+struct RuleArgs {
+    /// Flag items whose market value is at least this percent of their listed price
+    #[arg(long, default_value_t = 150.0)]
+    pull: f64,
+    /// Ignore items worth less than this many chaos
+    #[arg(long, default_value_t = 5.0)]
+    min_value: f64,
+}
+
+impl RuleArgs {
+    fn rule(&self) -> Rule {
+        Rule {
+            ratio: (self.pull / 100.0).max(1.0),
+            min_value_chaos: self.min_value.max(0.0),
+        }
+    }
+}
+
 #[derive(clap::Args)]
 struct DumpArgs {
     #[arg(long, env = "BIG_OIL_LEAGUE")]
     league: String,
-    /// Tab name substring (e.g. your dump tab)
+    /// Tab index or name substring
     #[arg(long)]
     tab: Option<String>,
-    /// Flag items listed below this percent of market value
-    #[arg(long, default_value_t = 50.0)]
-    underpriced: f64,
-    /// Ignore items worth less than this many chaos
-    #[arg(long, default_value_t = 20.0)]
-    min_value: f64,
-    /// Ignore gaps worth less than this many chaos
-    #[arg(long, default_value_t = 10.0)]
-    min_loss: f64,
-    /// Suggest a cut after this long at the same price
-    #[arg(long, default_value = "12h")]
-    every: String,
-    /// Cut size in percent
-    #[arg(long, default_value_t = 20.0)]
-    cut: f64,
-    /// Step down by a fixed amount in the tab's own currency (queue-method
-    /// ladders, e.g. --step 10 for 50c -> 40c); overrides --cut
-    #[arg(long)]
-    step: Option<f64>,
+    #[command(flatten)]
+    rule: RuleArgs,
     #[arg(long)]
     json: bool,
     /// Desktop notification with the summary
@@ -273,16 +277,12 @@ struct DumpArgs {
 struct ExtractArgs {
     #[arg(long, env = "BIG_OIL_LEAGUE")]
     league: String,
-    /// Tab name substring (your dump tab)
+    /// Tab index or name substring (your dump tab)
     #[arg(long)]
-    tab: Option<String>,
-    /// Ignore items worth less than this many chaos
-    #[arg(long, default_value_t = 5.0)]
-    min_value: f64,
-    /// Pull when an item is worth this percent of the tab price
-    #[arg(long, default_value_t = 150.0)]
-    pull: f64,
-    /// Stuck when an item is worth at most 100/this percent of the tab price
+    tab: String,
+    #[command(flatten)]
+    rule: RuleArgs,
+    /// Stuck when an item is worth at most 100/this percent of its listed price
     #[arg(long, default_value_t = 200.0)]
     stuck: f64,
     #[arg(long)]
@@ -293,15 +293,14 @@ struct ExtractArgs {
 struct OverlayArgs {
     #[arg(long, env = "BIG_OIL_LEAGUE")]
     league: String,
-    /// Tab name substring (the tab you are looking at)
+    /// Tab index or name substring (the tab you are looking at)
     #[arg(long)]
-    tab: Option<String>,
+    tab: String,
     /// little_oil config with stash_region + stash_grid
     #[arg(long)]
     config: Option<std::path::PathBuf>,
-    /// Green when an item is worth at least this percent of its listed price
-    #[arg(long, default_value_t = 150.0)]
-    cheap: f64,
+    #[command(flatten)]
+    rule: RuleArgs,
     /// Print the calibration and the marks, draw nothing
     #[arg(long)]
     dry_run: bool,
@@ -1174,16 +1173,23 @@ fn stash_list(cfg: &Config) -> Result<()> {
         println!("no own tabs scanned yet: big_oil stash watch --league <league>");
         return Ok(());
     }
+    let now = store::unix_now();
     let body: Vec<Vec<String>> = tabs
         .iter()
         .map(|t| {
+            let priced = big_oil::price::parse_note(&t.name).is_some();
             vec![
+                t.index.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
                 t.name.clone(),
-                t.league.clone(),
+                t.stash_type.clone().unwrap_or_else(|| "-".into()),
                 t.items.to_string(),
                 t.live.to_string(),
                 render::num(t.value_chaos),
                 render::num(t.value_divine),
+                t.price_since
+                    .filter(|_| priced)
+                    .map(|since| render::duration(now - since))
+                    .unwrap_or_else(|| "-".into()),
                 t.last_seen.map(render::age).unwrap_or_else(|| "-".into()),
             ]
         })
@@ -1192,7 +1198,7 @@ fn stash_list(cfg: &Config) -> Result<()> {
         "{}",
         render::table(
             &[
-                "tab", "league", "items", "live", "chaos", "divine", "scanned"
+                "#", "tab", "type", "items", "live", "chaos", "divine", "at price", "scanned"
             ],
             &body,
             40
@@ -1211,34 +1217,21 @@ fn stash_list(cfg: &Config) -> Result<()> {
 
 fn stash_value(cfg: &Config, league: &str) -> Result<()> {
     let mut store = open_own(cfg)?;
-    if store.price_lines(league)?.is_empty() {
-        bail!("no price snapshot for {league}: run `big_oil ninja fetch --league {league}` first");
-    }
+    store.rates(league)?;
     let n = store.value_items(league)?;
     println!("valued {n} own items in {league}");
     Ok(())
 }
 
 fn dump_settings(args: &DumpArgs) -> Result<DumpSettings> {
-    let cut_after_secs = render::parse_duration(&args.every)
-        .with_context(|| format!("--every {:?} is not a duration like 12h or 1d", args.every))?;
     Ok(DumpSettings {
-        tab: args.tab.clone(),
-        underprice_ratio: (args.underpriced / 100.0).clamp(0.01, 1.0),
-        min_value_chaos: args.min_value.max(0.0),
-        min_loss_chaos: args.min_loss.max(0.0),
-        cut_after_secs,
-        cut_pct: args.cut.clamp(0.0, 95.0),
-        cut_abs: args.step.filter(|s| *s > 0.0),
+        tab: args.tab.as_deref().map(TabSelector::parse).transpose()?,
+        rule: args.rule.rule(),
     })
 }
 
 fn build_report(store: &Store, league: &str, settings: &DumpSettings) -> Result<dump::Report> {
-    let lines = store.price_lines(league)?;
-    if lines.is_empty() {
-        bail!("no price snapshot for {league}: run `big_oil ninja fetch --league {league}` first");
-    }
-    let rates = Rates::from_lines(&lines);
+    let rates = store.rates(league)?;
     let rows = store.own_rows(league)?;
     Ok(dump::analyze(&rows, &rates, store::unix_now(), settings))
 }
@@ -1269,177 +1262,89 @@ fn run_dump(cfg: &Config, args: DumpArgs) -> Result<()> {
 /// Rows shown per section before summarising the rest.
 const REPORT_ROWS: usize = 20;
 
+/// A titled table, capped at `REPORT_ROWS`, followed by a blank line.
+fn print_section(title: &str, headers: &[&str], mut rows: Vec<Vec<String>>, width: usize) {
+    println!("{title}");
+    let extra = rows.len().saturating_sub(REPORT_ROWS);
+    rows.truncate(REPORT_ROWS);
+    print!("{}", render::table(headers, &rows, width));
+    if extra > 0 {
+        println!("… and {extra} more");
+    }
+    println!();
+}
+
 fn print_report(report: &dump::Report, settings: &DumpSettings) {
-    if report.is_quiet() {
-        println!("nothing to do: no underpriced items and no tab is due a cut");
+    if report.tabs.is_empty() {
+        println!("no own-tab items match; run `big_oil stash watch` first");
         return;
     }
+    let duration = |secs: Option<i64>| secs.map(render::duration).unwrap_or_else(|| "-".into());
 
-    // Tabs first: a dump tab is priced and stepped down as a unit.
-    if !report.tabs.is_empty() {
-        println!("TABS");
-        let body: Vec<Vec<String>> = report
-            .tabs
-            .iter()
-            .map(|t| {
-                let at = match (&t.price, t.priced == 0) {
-                    (Some(price), _) => price.clone(),
-                    (None, true) => "unpriced".to_string(),
-                    _ => "mixed".to_string(),
-                };
-                vec![
-                    t.name.clone(),
-                    t.items.to_string(),
-                    if t.unpriced > 0 {
-                        t.unpriced.to_string()
-                    } else {
-                        String::new()
-                    },
-                    at,
-                    render::duration(t.oldest_secs),
-                    t.suggested.clone().unwrap_or_else(|| "-".into()),
-                    chaos_cell(t.value_chaos),
-                    if t.underpriced > 0 {
-                        format!("{} underpriced", t.underpriced)
-                    } else {
-                        String::new()
-                    },
-                ]
-            })
-            .collect();
-        print!(
-            "{}",
-            render::table(
-                &[
-                    "tab",
-                    "items",
-                    "noprice",
-                    "at",
-                    "unchanged",
-                    "next",
-                    "value",
-                    "flags",
-                ],
-                &body,
-                38
-            )
-        );
-        println!();
-    }
+    let tabs = report
+        .tabs
+        .iter()
+        .map(|t| {
+            vec![
+                t.index.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                t.name.clone(),
+                t.items.to_string(),
+                t.price.clone().unwrap_or_else(|| "-".into()),
+                duration(t.at_price_secs),
+                chaos_cell(t.value_chaos),
+                duration(t.scanned_secs),
+                if t.underpriced > 0 {
+                    format!("{} underpriced", t.underpriced)
+                } else {
+                    String::new()
+                },
+            ]
+        })
+        .collect();
+    print_section(
+        "TABS",
+        &[
+            "#", "tab", "items", "price", "at price", "value", "scanned", "flags",
+        ],
+        tabs,
+        38,
+    );
 
     if !report.underpriced.is_empty() {
-        println!(
-            "UNDERPRICED — listed below {}% of market",
-            (settings.underprice_ratio * 100.0).round() as i64
-        );
-        let (body, extra) = cap(report
+        let rows = report
             .underpriced
             .iter()
             .map(|f| {
                 vec![
                     f.name.clone(),
-                    f.tab.clone().unwrap_or_default(),
-                    f.listed.clone().unwrap_or_else(|| "-".into()),
-                    f.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
-                    f.loss_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
+                    f.tab.clone(),
+                    f.listed.clone(),
+                    chaos_cell(f.value_chaos),
+                    format!("{:.1}", f.times),
+                    chaos_cell(f.loss_chaos),
                     render::duration(f.age_secs),
                 ]
             })
-            .collect());
-        print!(
-            "{}",
-            render::table(
-                &["item", "tab", "listed", "value", "missing", "for"],
-                &body,
-                42
-            )
+            .collect();
+        print_section(
+            &format!(
+                "UNDERPRICED — worth ≥{}% of the listed price",
+                (settings.rule.ratio * 100.0).round() as i64
+            ),
+            &["item", "tab", "listed", "value", "×", "missing", "for"],
+            rows,
+            42,
         );
-        if extra > 0 {
-            println!("… and {extra} more");
-        }
-        println!(
-            "value at risk: {} if these sell as listed",
-            chaos_cell(report.value_at_risk)
-        );
-        println!();
-    }
-
-    if !report.unpriced.is_empty() {
-        println!("NO PRICE — worth pricing");
-        let (body, extra) = cap(report
-            .unpriced
-            .iter()
-            .map(|f| {
-                vec![
-                    f.name.clone(),
-                    f.tab.clone().unwrap_or_default(),
-                    f.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
-                    render::duration(f.age_secs),
-                ]
-            })
-            .collect());
-        print!(
-            "{}",
-            render::table(&["item", "tab", "value", "for"], &body, 42)
-        );
-        if extra > 0 {
-            println!("… and {extra} more");
-        }
-        println!();
-    }
-
-    if !report.due.is_empty() {
-        println!(
-            "DUE FOR A CUT — unchanged for {}h, {}",
-            settings.cut_after_secs / 3600,
-            if settings.cut_abs.is_some() {
-                format!(
-                    "step down {}",
-                    render::num(settings.cut_abs.unwrap_or_default())
-                )
-            } else {
-                format!("cut {}%", settings.cut_pct.round() as i64)
-            }
-        );
-        let (body, extra) = cap(report
-            .due
-            .iter()
-            .map(|f| {
-                vec![
-                    f.name.clone(),
-                    f.tab.clone().unwrap_or_default(),
-                    f.listed.clone().unwrap_or_else(|| "-".into()),
-                    f.suggested.clone().unwrap_or_else(|| "-".into()),
-                    render::duration(f.age_secs),
-                ]
-            })
-            .collect());
-        print!(
-            "{}",
-            render::table(&["item", "tab", "now", "cut to", "for"], &body, 42)
-        );
-        if extra > 0 {
-            println!("… and {extra} more");
-        }
-        println!();
     }
 
     println!("{}", report.summary());
 }
 
-fn cap(mut rows: Vec<Vec<String>>) -> (Vec<Vec<String>>, usize) {
-    let extra = rows.len().saturating_sub(REPORT_ROWS);
-    rows.truncate(REPORT_ROWS);
-    (rows, extra)
-}
-
 /// Called after each stash pass so the reminder is impossible to miss.
 fn alert_dump(store: &Store, league: &str, notify: bool) {
-    let lines = match store.price_lines(league) {
-        Ok(lines) if !lines.is_empty() => lines,
-        _ => return,
+    let Ok(rates) = store.rates(league) else {
+        return;
     };
-    let rates = Rates::from_lines(&lines);
     let rows = match store.own_rows(league) {
         Ok(rows) => rows,
         Err(e) => {
@@ -1473,23 +1378,14 @@ fn chaos_cell(value: f64) -> String {
 
 fn run_extract(cfg: &Config, args: ExtractArgs) -> Result<()> {
     let store = open_own(cfg)?;
-    let lines = store.price_lines(&args.league)?;
-    if lines.is_empty() {
-        bail!(
-            "no price snapshot for {}: run `big_oil ninja fetch --league {}` first",
-            args.league,
-            args.league
-        );
-    }
-    let rates = Rates::from_lines(&lines);
+    let rates = store.rates(&args.league)?;
     let rows = store.own_rows(&args.league)?;
+    let tab_rows = listing::resolve_one(&rows, &TabSelector::parse(&args.tab)?)?;
     let settings = ExtractSettings {
-        tab: args.tab.clone(),
-        min_value_chaos: args.min_value.max(0.0),
-        pull_ratio: (args.pull / 100.0).max(1.0),
+        rule: args.rule.rule(),
         stuck_ratio: (args.stuck / 100.0).max(1.0),
     };
-    let report = extract::analyze(&rows, &rates, &settings);
+    let report = extract::analyze(&tab_rows, &rates, &settings);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -1499,59 +1395,55 @@ fn run_extract(cfg: &Config, args: ExtractArgs) -> Result<()> {
 }
 
 fn print_extract(report: &extract::Report) {
-    if report.tabs.is_empty() {
-        println!("no own-tab items match; run `big_oil stash watch` first");
-        return;
-    }
     let price = match (&report.tab_price, report.tab_price_chaos) {
         (Some(p), Some(c)) => format!("{p} (~{}c)", render::num(c)),
         (Some(p), None) => p.clone(),
-        _ => "unpriced".to_string(),
+        _ => "none".to_string(),
     };
+    let index = report
+        .tab_index
+        .map(|i| format!(" (tab {i})"))
+        .unwrap_or_default();
     println!(
-        "{} — {} items, tab price {}",
-        report.tabs.join(", "),
-        report.items,
-        price
+        "{}{index} — {} items, tab price {price}",
+        render::clean(&report.tab),
+        report.items
     );
+    println!();
 
     if !report.unidentified.is_empty() {
-        println!();
-        println!(
-            "ID FIRST ({}) — an unidentified unique could be anything",
-            report.unidentified.len()
-        );
-        let (body, extra) = cap(report
+        let rows = report
             .unidentified
             .iter()
             .map(|r| vec![r.pos_cell(), r.name.clone(), r.kind().to_string()])
-            .collect());
-        print!("{}", render::table(&["pos", "item", "type"], &body, 40));
-        if extra > 0 {
-            println!("… and {extra} more");
-        }
+            .collect();
+        print_section(
+            &format!(
+                "ID FIRST ({}) — an unidentified unique could be anything",
+                report.unidentified.len()
+            ),
+            &["pos", "item", "type"],
+            rows,
+            40,
+        );
     }
 
     if !report.liquid.is_empty() {
-        println!();
-        println!(
-            "LIQUID ({}) — priced by poe.ninja; pull when worth more than the tab",
-            report.liquid.len()
-        );
-        let (body, extra) = cap(report
+        let rows = report
             .liquid
             .iter()
             .map(|r| {
                 vec![
                     r.pos_cell(),
                     r.name.clone(),
+                    r.listed.clone().unwrap_or_else(|| "-".into()),
                     r.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
                     r.times
                         .map(|t| {
                             if t >= 1.0 {
-                                format!("{t:.1}x")
+                                format!("{t:.1}")
                             } else {
-                                format!("{t:.2}x")
+                                format!("{t:.2}")
                             }
                         })
                         .unwrap_or_else(|| "-".into()),
@@ -1567,21 +1459,19 @@ fn print_extract(report: &extract::Report) {
                     .to_string(),
                 ]
             })
-            .collect());
-        print!(
-            "{}",
-            render::table(
-                &["pos", "item", "value", "tab×", "listings", "verdict"],
-                &body,
-                42
-            )
+            .collect();
+        print_section(
+            &format!(
+                "LIQUID ({}) — priced by poe.ninja; pull what is worth more than its price",
+                report.liquid.len()
+            ),
+            &["pos", "item", "listed", "value", "×", "listings", "verdict"],
+            rows,
+            42,
         );
-        if extra > 0 {
-            println!("… and {extra} more");
-        }
     }
 
-    println!("\n{}", report.summary());
+    println!("{}", report.summary());
 }
 
 fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
@@ -1596,6 +1486,7 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
     }
     let rates = Rates::from_lines(&lines);
     let rows = store.own_rows(&args.league)?;
+    let tab_rows = listing::resolve_one(&rows, &TabSelector::parse(&args.tab)?)?;
 
     let path = match args.config.clone() {
         Some(path) => path,
@@ -1603,10 +1494,7 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
     };
     let calibration = Calibration::from_little_oil(&path)?;
 
-    let settings = overlay::Settings {
-        cheap_ratio: (args.cheap / 100.0).max(1.0),
-    };
-    let marks = overlay::marks(&rows, &rates, &calibration, &settings);
+    let marks = overlay::marks(&tab_rows, &rates, &calibration, &args.rule.rule());
     let mut counts = [0usize; 3];
     for mark in &marks {
         counts[match mark.colour {
@@ -1616,9 +1504,9 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
         }] += 1;
     }
     println!(
-        "{} frames over {}: {} green (too cheap), {} blue (move to a group tab), {} grey",
+        "{} frames on {}: {} green (underpriced), {} blue (move to a group tab), {} grey",
         marks.len(),
-        calibration.stash.w,
+        render::clean(&listing::tab_label(tab_rows[0])),
         counts[1],
         counts[2],
         counts[0]

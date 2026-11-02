@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::listing::{self, Rule};
 use crate::rates::Rates;
 use crate::store::ItemRow;
 
@@ -145,62 +146,30 @@ impl Calibration {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Settings {
-    /// Green when value is at least this multiple of the listed price.
-    pub cheap_ratio: f64,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings { cheap_ratio: 1.5 }
-    }
-}
-
 /// Frames for every item that has a position on the grid.
-pub fn marks(rows: &[ItemRow], rates: &Rates, cal: &Calibration, settings: &Settings) -> Vec<Mark> {
+pub fn marks(rows: &[&ItemRow], rates: &Rates, cal: &Calibration, rule: &Rule) -> Vec<Mark> {
     rows.iter()
         .filter(|row| row.delisted_at.is_none())
         .filter_map(|row| {
             let rect = cal.cell_rect(row.x?, row.y?, row.w.unwrap_or(1), row.h.unwrap_or(1))?;
             Some(Mark {
                 rect,
-                colour: classify(row, rates, settings),
+                colour: classify(row, rates, rule),
             })
         })
         .collect()
 }
 
-pub fn classify(row: &ItemRow, rates: &Rates, settings: &Settings) -> Colour {
-    if is_cheap(row, rates, settings) {
+/// Green when worth clearly more than listed (the shared [`Rule`]), or an
+/// unidentified unique — nothing is known about those until identified.
+pub fn classify(row: &ItemRow, rates: &Rates, rule: &Rule) -> Colour {
+    if listing::unidentified_unique(row) || listing::underpriced(row, rates, rule).is_some() {
         Colour::Cheap
     } else if is_groupable(row) {
         Colour::Groupable
     } else {
         Colour::Settled
     }
-}
-
-/// Worth clearly more than the note says. Unidentified uniques count: nothing
-/// is known about them until they are identified.
-fn is_cheap(row: &ItemRow, rates: &Rates, settings: &Settings) -> bool {
-    if row.identified == Some(false) && row.frame_type == Some(3) {
-        return true;
-    }
-    let (Some(value), Some(amount), Some(currency)) = (
-        row.value_chaos,
-        row.price_amount,
-        row.price_currency.as_deref(),
-    ) else {
-        return false;
-    };
-    if amount <= 0.0 {
-        return false;
-    }
-    let Some(per_unit) = rates.chaos_per_unit(currency) else {
-        return false;
-    };
-    value >= amount * per_unit * settings.cheap_ratio
 }
 
 /// Items with a natural home in another tab.
@@ -347,12 +316,17 @@ mod tests {
         gem.value_chaos = Some(4000.0);
         gem.price_amount = Some(1.0);
         gem.price_currency = Some("divine".into());
-        let rates = Rates::from_lines(&[]);
-        // No currency data: chaos conversion fails, so it stays blue.
-        assert_eq!(
-            classify(&gem, &rates, &Settings::default()),
-            Colour::Groupable
-        );
+        let rates = Rates::from_lines(&[crate::ninja::PriceLine {
+            category: "Currency".into(),
+            name: Some("Divine Orb".into()),
+            chaos: 400.0,
+            ..Default::default()
+        }]);
+        assert_eq!(classify(&gem, &rates, &Rule::default()), Colour::Cheap);
+
+        // Without a rate the price cannot be judged, so it stays blue.
+        let none = Rates::from_lines(&[]);
+        assert_eq!(classify(&gem, &none, &Rule::default()), Colour::Groupable);
     }
 
     #[test]
@@ -362,10 +336,7 @@ mod tests {
         unique.identified = Some(false);
         unique.name = None;
         let rates = Rates::from_lines(&[]);
-        assert_eq!(
-            classify(&unique, &rates, &Settings::default()),
-            Colour::Cheap
-        );
+        assert_eq!(classify(&unique, &rates, &Rule::default()), Colour::Cheap);
     }
 
     #[test]
@@ -375,7 +346,7 @@ mod tests {
         let mut placed = row("Placed");
         placed.y = Some(4);
         let rates = Rates::from_lines(&[]);
-        let marks = marks(&[hidden, placed], &rates, &cal(), &Settings::default());
+        let marks = marks(&[&hidden, &placed], &rates, &cal(), &Rule::default());
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].rect.y, 200 + 136);
     }
