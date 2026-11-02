@@ -2,6 +2,7 @@
 
 mod support;
 
+use big_oil::listing::TabSelector;
 use big_oil::model::Item;
 use big_oil::ninja::PriceLine;
 use big_oil::own::{self, OwnClient, SessionExpired};
@@ -237,19 +238,27 @@ fn opens_a_v1_database_and_migrates_it() {
                  corrupted INTEGER NOT NULL DEFAULT 0, identified INTEGER, icon TEXT, note TEXT,
                  price_amount REAL, price_currency TEXT, price_type TEXT, mods_text TEXT,
                  first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, delisted_at INTEGER,
-                 raw TEXT NOT NULL);",
+                 raw TEXT NOT NULL);
+             -- A tab already priced by name before the tab clock existed.
+             INSERT INTO stashes (id, name, first_seen, last_seen)
+                 VALUES ('stash-1', '~price 1 divine', 1, 1);",
         )
         .unwrap();
     }
 
     let mut store = Store::open(&path).unwrap();
     let stats = store
-        .ingest_own_tab(&tab("stash-1", "Dump"), &[headhunter()])
+        .ingest_own_tab(&tab("stash-1", "~price 1 divine"), &[headhunter()])
         .unwrap();
     assert_eq!(stats.items_new, 1);
     let row = store.item("h1").unwrap().unwrap();
     assert_eq!(row.source, "own");
     assert_eq!(row.value_chaos, None);
+    assert!(row.price_from_tab);
+    assert!(
+        row.tab_price_since.is_some(),
+        "an already-priced tab starts its clock on the first scan"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -341,6 +350,51 @@ fn scan_skips_failing_tabs_and_reuses_tab_zero() {
     assert_eq!(belt.stash_id, "t0");
     assert_eq!(belt.tab_index, Some(0));
     assert_eq!(belt.stash_type.as_deref(), Some("QuadStash"));
+}
+
+#[test]
+fn scan_keeps_unselected_tab_indexes_current() {
+    let mut store = Store::open_memory().unwrap();
+    store
+        .ingest_own_tab(
+            &OwnTab {
+                index: 5,
+                ..tab("maps", "Maps")
+            },
+            &[headhunter()],
+        )
+        .unwrap();
+
+    // Maps was dragged to index 2 and Dump now sits at 5.
+    let list = json!({
+        "numTabs": 6,
+        "tabs": [
+            {"n": "Maps", "i": 2, "id": "maps", "type": "PremiumStash"},
+            {"n": "Dump", "i": 5, "id": "dump", "type": "PremiumStash"}
+        ],
+        "items": []
+    })
+    .to_string();
+    let dump = json!({"items": [
+        {"id": "c1", "typeLine": "Chaos Orb", "baseType": "Chaos Orb", "frameType": 5}
+    ]})
+    .to_string();
+    let (addr, handle) = mock(vec![ok_json(&list), ok_json(&dump)]);
+    let mut client =
+        OwnClient::with_base(&addr, "cookie", "me@example.com").with_min_interval(Duration::ZERO);
+    let report = own::scan(
+        &mut store,
+        &mut client,
+        "Tester#1",
+        "Standard",
+        &[TabSelector::Index(5)],
+    )
+    .unwrap();
+    handle.join().unwrap();
+
+    assert_eq!(report.scanned, vec!["dump"]);
+    assert_eq!(store.item("h1").unwrap().unwrap().tab_index, Some(2));
+    assert_eq!(store.item("c1").unwrap().unwrap().tab_index, Some(5));
 }
 
 #[test]

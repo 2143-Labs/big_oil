@@ -714,6 +714,21 @@ impl Store {
         Ok(stats)
     }
 
+    /// Record where every listed own tab sits now, scanned or not, so `--tab N`
+    /// never matches a tab that has since been moved.
+    pub fn set_own_tab_indexes(&mut self, tabs: &[(String, i64)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE stashes SET tab_index = ?2 WHERE id = ?1 AND source = 'own'")?;
+            for (id, index) in tabs {
+                stmt.execute(params![id, index])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Close every open own tab in `league` whose stash id is not in `present`
     /// (the account's current tab list): its items get `removed` events and the
     /// tab leaves `own_tabs`. Returns how many tabs were closed.
@@ -1205,7 +1220,8 @@ fn ingest_stash(
         (Some(_), Some((prev_name, since))) => {
             let prev = prev_name.as_deref().and_then(price::parse_note);
             if price::same_price(prev.as_ref(), tab_price.as_ref()) {
-                since
+                // A tab priced before the clock existed starts it now.
+                since.or_else(|| tab_price.as_ref().map(|_| now))
             } else {
                 tab_price.as_ref().map(|_| now)
             }

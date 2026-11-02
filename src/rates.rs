@@ -97,7 +97,8 @@ impl Rates {
         if key.is_empty() {
             return None;
         }
-        if key == "chaos" {
+        // The unit of account never depends on the snapshot.
+        if matches!(key.as_str(), "c" | "chaos" | "chaosorb") {
             return Some(1.0);
         }
         // Alias first, then the name or trade id as typed. No substring
@@ -146,6 +147,9 @@ mod tests {
     #[test]
     fn chaos_is_always_one() {
         assert_eq!(rates().chaos_per_unit("chaos"), Some(1.0));
+        let empty = Rates::from_lines(&[]);
+        assert_eq!(empty.chaos_per_unit("c"), Some(1.0));
+        assert_eq!(empty.chaos_per_unit("Chaos Orb"), Some(1.0));
     }
 
     #[test]

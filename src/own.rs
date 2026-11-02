@@ -302,6 +302,14 @@ pub fn scan(
     if !list.tabs.is_empty() {
         let present: HashSet<String> = list.tabs.iter().map(|t| t.stash_id(league)).collect();
         report.closed_tabs = store.close_missing_own_tabs(league, &present)?;
+        // Tabs get dragged around: keep every known tab's index current, not
+        // just the selected ones, so index selectors stay unambiguous.
+        let indexes: Vec<(String, i64)> = list
+            .tabs
+            .iter()
+            .map(|t| (t.stash_id(league), t.index))
+            .collect();
+        store.set_own_tab_indexes(&indexes)?;
     }
 
     let visible: Vec<&TabInfo> = list.tabs.iter().filter(|t| !t.hidden).collect();
