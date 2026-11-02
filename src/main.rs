@@ -441,7 +441,12 @@ fn run() -> Result<()> {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // The HTTP stack logs raw requests (cookies and bearer tokens included) at
+    // debug/trace; cap it whatever RUST_LOG says.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive("ureq_proto=warn".parse().expect("static directive"))
+        .add_directive("ureq=warn".parse().expect("static directive"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -517,6 +522,9 @@ fn make_client(cfg: &Config, token: &auth::Token, base_url: Option<String>) -> R
 }
 
 fn watch(cfg: &Config, args: Watch) -> Result<()> {
+    if let Some(url) = &args.base_url {
+        config::check_base_url(url)?;
+    }
     let mut store = open_market(cfg)?;
     if let Some(id) = &args.from_id {
         store.set_cursor(id)?;
@@ -817,7 +825,10 @@ fn show_item(cfg: &Config, id: &str, source: Option<Source>, json: bool) -> Resu
         return Ok(());
     }
 
-    println!("{}", item.display_name());
+    // Every string here came from the API: strip control characters so a
+    // crafted name or note cannot drive the terminal.
+    let clean = |s: Option<String>| render::clean(&s.unwrap_or_else(|| "?".into()));
+    println!("{}", render::clean(&item.display_name()));
     println!("  id        {}", item.id);
     println!(
         "  league    {}",
@@ -825,8 +836,8 @@ fn show_item(cfg: &Config, id: &str, source: Option<Source>, json: bool) -> Resu
     );
     println!(
         "  stash     {} ({})",
-        item.stash_name.clone().unwrap_or_else(|| "?".into()),
-        item.account.clone().unwrap_or_else(|| "?".into())
+        clean(item.stash_name.clone()),
+        clean(item.account.clone())
     );
     println!(
         "  rarity    {} | ilvl {} | sockets {} | links {} {}",
@@ -842,10 +853,10 @@ fn show_item(cfg: &Config, id: &str, source: Option<Source>, json: bool) -> Resu
     );
     println!(
         "  price     {} {}",
-        item.price().unwrap_or_else(|| "-".into()),
+        render::clean(&item.price().unwrap_or_else(|| "-".into())),
         item.note
             .as_deref()
-            .map(|n| format!("note={n:?}"))
+            .map(|n| format!("note={:?}", render::clean(n)))
             .unwrap_or_default()
     );
     if item.value_chaos.is_some() {
@@ -869,7 +880,7 @@ fn show_item(cfg: &Config, id: &str, source: Option<Source>, json: bool) -> Resu
     if !mods_text.trim().is_empty() {
         println!("  mods:");
         for line in mods_text.lines().filter(|l| !l.trim().is_empty()) {
-            println!("    {line}");
+            println!("    {}", render::clean(line));
         }
     }
     if valuations.len() > 1 {
@@ -1117,6 +1128,9 @@ fn ninja_fetch_cmd(
     no_currency: bool,
     base_url: Option<String>,
 ) -> Result<()> {
+    if let Some(url) = &base_url {
+        config::check_base_url(url)?;
+    }
     let mut store = open_own(cfg)?;
     let item_types: Vec<String> = match types {
         Some(spec) => spec
@@ -1134,6 +1148,9 @@ fn ninja_fetch_cmd(
 }
 
 fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
+    for url in [&args.base_url, &args.ninja_base_url].into_iter().flatten() {
+        config::check_base_url(url)?;
+    }
     let cookie = cfg.poesessid.clone().with_context(|| {
         "no POESESSID configured.\n\
          The stash endpoints are the website's own, so they need a logged-in session:\n\

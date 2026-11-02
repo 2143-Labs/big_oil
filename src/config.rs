@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct ConfigFile {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
@@ -25,7 +25,27 @@ pub struct ConfigFile {
     pub interval_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+/// `Some("<redacted>")` / `None`: shows whether a secret is set, never what it is.
+fn redacted(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
+impl std::fmt::Debug for ConfigFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigFile")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redacted(&self.client_secret))
+            .field("poesessid", &redacted(&self.poesessid))
+            .field("account", &self.account)
+            .field("contact", &self.contact)
+            .field("db_path", &self.db_path)
+            .field("own_db_path", &self.own_db_path)
+            .field("interval_secs", &self.interval_secs)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
@@ -40,6 +60,22 @@ pub struct Config {
     pub config_dir: PathBuf,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redacted(&self.client_secret))
+            .field("poesessid", &redacted(&self.poesessid))
+            .field("account", &self.account)
+            .field("contact", &self.contact)
+            .field("db_path", &self.db_path)
+            .field("own_db_path", &self.own_db_path)
+            .field("interval_secs", &self.interval_secs)
+            .field("config_dir", &self.config_dir)
+            .finish()
+    }
+}
+
 impl Config {
     pub fn load(db_override: Option<PathBuf>, own_db_override: Option<PathBuf>) -> Result<Config> {
         let config_dir = config_dir()?;
@@ -50,6 +86,16 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigFile::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", file_path.display())),
         };
+        #[cfg(unix)]
+        if file.client_secret.is_some() || file.poesessid.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&file_path)
+                && meta.permissions().mode() & 0o077 != 0
+            {
+                let path = file_path.display();
+                tracing::warn!("{path} is readable by other users; run chmod 600 {path}");
+            }
+        }
 
         let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         let db_path = match db_override
@@ -170,4 +216,61 @@ pub fn user_agent(client_id: &str, contact: &str) -> String {
 /// website's own stash endpoint).
 pub fn app_user_agent(contact: &str) -> String {
     format!("big_oil/{VERSION} (contact: {contact})")
+}
+
+/// Credentials and session cookies only ever travel over https; plain http is
+/// allowed for a test server on this machine.
+pub fn check_base_url(url: &str) -> Result<()> {
+    let lower = url.to_ascii_lowercase();
+    let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+        .iter()
+        .any(|host| {
+            lower.starts_with(host)
+                && matches!(lower.as_bytes().get(host.len()), None | Some(b':' | b'/'))
+        });
+    if lower.starts_with("https://") || local {
+        return Ok(());
+    }
+    bail!(
+        "refusing {url}: credentials and session cookies are only sent over https \
+         (plain http is allowed for localhost test servers)"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_urls_must_be_https_or_local() {
+        for ok in [
+            "https://www.pathofexile.com",
+            "http://127.0.0.1:8765",
+            "http://localhost/x",
+            "http://[::1]:9",
+        ] {
+            assert!(check_base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.com",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "ftp://x",
+        ] {
+            let err = check_base_url(bad).unwrap_err().to_string();
+            assert!(err.starts_with(&format!("refusing {bad}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn debug_hides_secrets() {
+        let file = ConfigFile {
+            client_secret: Some("client-sekrit".into()),
+            poesessid: Some("session-sekrit".into()),
+            ..Default::default()
+        };
+        let shown = format!("{file:?}");
+        assert!(!shown.contains("sekrit"), "{shown}");
+        assert!(shown.contains("<redacted>"));
+    }
 }
