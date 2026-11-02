@@ -500,14 +500,6 @@ impl Store {
         self.set_meta("next_change_id", id)
     }
 
-    /// Drop the cursor so the next poll restarts from the stream head. Used
-    /// when the API rejects a cursor (e.g. after a long outage).
-    pub fn clear_cursor(&mut self) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM meta WHERE key = 'next_change_id'", [])?;
-        Ok(())
-    }
-
     /// Apply one page of the stream. The page's `next_change_id` cursor and the
     /// page contents move forward in the same transaction, so a crash can never
     /// skip a page.

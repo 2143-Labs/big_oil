@@ -1,11 +1,22 @@
-//! Client behaviour against a local mock: request shape, headers, and that a
-//! 429 with `Retry-After` is honoured before the retry.
+//! Client behaviour against a local mock: request shape, headers, that a 429
+//! with `Retry-After` is honoured before the retry, and the typed errors the
+//! stream loop branches on.
 
 mod support;
 
-use big_oil::client::Client;
+use big_oil::client::{BadPage, Client, HttpStatus, fetch_head};
 use std::time::{Duration, Instant};
 use support::{mock, response};
+
+fn client(addr: &str) -> Client {
+    Client::new(
+        format!("{addr}/public-stash-tabs"),
+        "t",
+        "me@example.com",
+        "myapp",
+    )
+    .with_min_interval(Duration::ZERO)
+}
 
 const PAGE: &str = r#"{"next_change_id":"next","stashes":[
     {"id":"s1","public":true,"accountName":"acct#1","stash":"Shop","stashType":"PremiumStash",
@@ -40,7 +51,7 @@ fn sends_bearer_auth_and_paginates() {
     let requests = handle.join().unwrap();
     let req = &requests[0];
     assert!(
-        req.starts_with("GET /public-stash-tabs?id=cursor-1&realm=xbox "),
+        req.starts_with("GET /public-stash-tabs/xbox?id=cursor-1 "),
         "{req}"
     );
     assert!(req.contains("authorization: Bearer secret-token"), "{req}");
@@ -103,7 +114,47 @@ fn forbidden_reports_the_missing_scope() {
         "me@example.com",
         "myapp",
     );
-    let err = client.fetch(None, None).unwrap_err().to_string();
-    assert!(err.contains("service:psapi"), "{err}");
+    let err = client.fetch(None, None).unwrap_err();
+    assert_eq!(err.downcast_ref::<HttpStatus>().map(|s| s.code), Some(403));
+    assert!(err.to_string().contains("service:psapi"), "{err}");
     handle.join().unwrap();
+}
+
+#[test]
+fn bad_request_is_typed() {
+    let (addr, handle) = mock(vec![response("400 Bad Request", &[], "invalid id")]);
+    let err = client(&addr).fetch(Some("stale"), None).unwrap_err();
+    let status = err.downcast_ref::<HttpStatus>().expect("typed HTTP error");
+    assert_eq!(status.code, 400);
+    assert!(status.message.contains("rejected the cursor"), "{status}");
+    handle.join().unwrap();
+}
+
+#[test]
+fn malformed_page_reports_next_id() {
+    let (addr, handle) = mock(vec![response(
+        "200 OK",
+        &[("Content-Type", "application/json")],
+        r#"{"next_change_id":"n2","stashes":[{"id":1}]}"#,
+    )]);
+    let err = client(&addr).fetch(Some("1-2-3"), None).unwrap_err();
+    let bad = err.downcast_ref::<BadPage>().expect("typed bad page");
+    assert_eq!(bad.next_change_id.as_deref(), Some("n2"));
+    assert_eq!(bad.change_id.as_deref(), Some("1-2-3"));
+    assert!(bad.body.contains("\"stashes\""));
+    handle.join().unwrap();
+}
+
+#[test]
+fn fetch_head_reads_psapi_id() {
+    let (addr, handle) = mock(vec![response(
+        "200 OK",
+        &[("Content-Type", "application/json")],
+        r#"{"psapi":"1-2-3","forum":"9"}"#,
+    )]);
+    let id = fetch_head(&format!("{addr}/api/trade/data/change-ids"), "big_oil/test").unwrap();
+    assert_eq!(id, "1-2-3");
+    let requests = handle.join().unwrap();
+    assert!(!requests[0].to_ascii_lowercase().contains("authorization"));
+    assert!(requests[0].contains("user-agent: big_oil/test"));
 }

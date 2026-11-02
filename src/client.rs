@@ -7,6 +7,7 @@
 //! `Retry-After`.
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -14,9 +15,54 @@ use crate::config::user_agent;
 use crate::model::StashPage;
 
 pub const DEFAULT_BASE: &str = "https://api.pathofexile.com/public-stash-tabs";
+/// The trade site's view of the current stream position (undocumented; no
+/// auth). `psapi` is a `next_change_id` at the live edge.
+pub const HEAD_URL: &str = "https://www.pathofexile.com/api/trade/data/change-ids";
 const MAX_ATTEMPTS: u32 = 6;
 /// Never hammer the endpoint even when no limits have been observed yet.
 const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The API answered with a status the client does not retry (or no longer
+/// retries). Callers branch on `code`.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub code: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// A 200 response whose body is not a stash page. The body is kept so it can
+/// be saved, and the next cursor when it can still be read.
+#[derive(Debug)]
+pub struct BadPage {
+    pub change_id: Option<String>,
+    pub next_change_id: Option<String>,
+    pub body: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for BadPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unparseable page (change_id={:?}): {}",
+            self.change_id, self.reason
+        )
+    }
+}
+
+impl std::error::Error for BadPage {}
+
+fn http_error(code: u16, message: String) -> anyhow::Error {
+    HttpStatus { code, message }.into()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Limit {
@@ -202,9 +248,25 @@ impl Client {
         self
     }
 
-    /// Fetch the page starting at `change_id` (or the stream head when `None`).
-    /// Retries rate limiting and transient failures internally.
+    /// Swap in a fresh access token, keeping the learned rate limits.
+    pub fn set_token(&mut self, token: impl Into<String>) {
+        self.token = token.into();
+    }
+
+    /// Fetch the page starting at `change_id` (or the oldest page when `None`).
+    /// Retries rate limiting and transient failures internally; gives up with
+    /// an [`HttpStatus`] or [`BadPage`] error.
     pub fn fetch(&mut self, change_id: Option<&str>, realm: Option<&str>) -> Result<StashPage> {
+        let mut url = self.base.clone();
+        if let Some(realm) = realm {
+            url.push('/');
+            url.push_str(&urlencode(realm));
+        }
+        if let Some(id) = change_id {
+            url.push_str("?id=");
+            url.push_str(&urlencode(id));
+        }
+
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -212,20 +274,6 @@ impl Client {
             if !wait.is_zero() {
                 self.total_wait += wait;
                 std::thread::sleep(wait);
-            }
-
-            let mut url = self.base.clone();
-            let mut sep = '?';
-            if let Some(id) = change_id {
-                url.push(sep);
-                url.push_str("id=");
-                url.push_str(&urlencode(id));
-                sep = '&';
-            }
-            if let Some(realm) = realm {
-                url.push(sep);
-                url.push_str("realm=");
-                url.push_str(&urlencode(realm));
             }
 
             self.limiter.note();
@@ -259,25 +307,51 @@ impl Client {
                         .body_mut()
                         .read_to_string()
                         .context("reading public stash page body")?;
-                    return StashPage::parse(text.as_bytes()).with_context(|| {
-                        format!(
-                            "parsing page ({} bytes, change_id={change_id:?})",
-                            text.len()
-                        )
+                    return StashPage::parse(text.as_bytes()).map_err(|e| {
+                        let next_change_id = serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|v| v["next_change_id"].as_str().map(str::to_owned));
+                        BadPage {
+                            change_id: change_id.map(str::to_owned),
+                            next_change_id,
+                            reason: format!("{e:#} ({} bytes)", text.len()),
+                            body: text,
+                        }
+                        .into()
                     });
                 }
-                401 => bail!(
-                    "401 Unauthorized: the access token was rejected.\n\
-                     Tokens can be revoked from the application settings page. Run `big_oil auth --force`."
-                ),
-                403 => bail!(
-                    "403 Forbidden: {}\n\
-                     The application needs the `service:psapi` scope (client_credentials grant).",
-                    resp.body_mut().read_to_string().unwrap_or_default().trim()
-                ),
+                400 => {
+                    let body = resp.body_mut().read_to_string().unwrap_or_default();
+                    return Err(http_error(
+                        400,
+                        format!("HTTP 400: the API rejected the cursor: {}", body.trim()),
+                    ));
+                }
+                401 => {
+                    return Err(http_error(
+                        401,
+                        "401 Unauthorized: the access token was rejected.\n\
+                         Tokens can be revoked from the application settings page. Run `big_oil auth --force`."
+                            .into(),
+                    ));
+                }
+                403 => {
+                    let body = resp.body_mut().read_to_string().unwrap_or_default();
+                    return Err(http_error(
+                        403,
+                        format!(
+                            "403 Forbidden: {}\n\
+                             The application needs the `service:psapi` scope (client_credentials grant).",
+                            body.trim()
+                        ),
+                    ));
+                }
                 429 => {
                     if attempt >= MAX_ATTEMPTS {
-                        bail!("429 Too Many Requests after {attempt} attempts; backing off");
+                        return Err(http_error(
+                            429,
+                            format!("429 Too Many Requests after {attempt} attempts; backing off"),
+                        ));
                     }
                     // `observe` already set restricted_until from Retry-After;
                     // fall back to exponential backoff if the header was absent.
@@ -286,25 +360,53 @@ impl Client {
                         self.total_wait += backoff;
                         std::thread::sleep(backoff);
                     }
-                    continue;
                 }
                 500..=599 => {
                     if attempt >= MAX_ATTEMPTS {
-                        bail!("server error {status} after {attempt} attempts");
+                        return Err(http_error(
+                            status,
+                            format!("server error {status} after {attempt} attempts"),
+                        ));
                     }
                     let backoff = Duration::from_secs(1 << attempt.min(5));
                     self.total_wait += backoff;
                     tracing::warn!(status, ?backoff, "server error, retrying");
                     std::thread::sleep(backoff);
-                    continue;
                 }
                 other => {
                     let body = resp.body_mut().read_to_string().unwrap_or_default();
-                    bail!("unexpected HTTP {other}: {}", body.trim());
+                    return Err(http_error(
+                        other,
+                        format!("unexpected HTTP {other}: {}", body.trim()),
+                    ));
                 }
             }
         }
     }
+}
+
+/// The current `next_change_id` at the live edge of the stream, from the trade
+/// site (no auth).
+pub fn fetch_head(url: &str, user_agent: &str) -> Result<String> {
+    let failed = || format!("could not read the current change id from {url}");
+    let mut resp = agent(Duration::from_secs(30))
+        .get(url)
+        .header("User-Agent", user_agent)
+        .header("Accept", "application/json")
+        .call()
+        .with_context(failed)?;
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    if status != 200 {
+        let excerpt: String = body.trim().chars().take(200).collect();
+        bail!("{}: HTTP {status}: {excerpt}", failed());
+    }
+    let value: Value = serde_json::from_str(&body).with_context(failed)?;
+    value["psapi"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .with_context(|| format!("{}: the response has no psapi id", failed()))
 }
 
 /// An HTTP agent that leaves status handling to the caller (429 has meaning

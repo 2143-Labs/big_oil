@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use big_oil::auth;
-use big_oil::client::{self, Client};
-use big_oil::config::Config;
+use big_oil::client::{self, BadPage, Client, HttpStatus};
+use big_oil::config::{self, Config};
 use big_oil::dump::{self, Settings as DumpSettings};
 use big_oil::extract::{self, Settings as ExtractSettings};
 use big_oil::listing::{self, Rule, TabSelector};
@@ -110,6 +110,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show or move the public stream cursor
+    Cursor {
+        #[command(subcommand)]
+        cmd: CursorCommand,
+    },
     /// Your own stash tabs (needs POESESSID)
     Stash {
         #[command(subcommand)]
@@ -141,15 +146,46 @@ struct Watch {
     /// Stop after N ingested pages
     #[arg(long)]
     max_pages: Option<usize>,
-    /// xbox or sony (default: PC)
+    /// Console realm (default: PC)
+    #[arg(long, value_enum)]
+    realm: Option<Realm>,
+    /// Start (or restart) from this next_change_id
+    #[arg(long, conflicts_with = "from_head")]
+    from_id: Option<String>,
+    /// Start (or restart) at the live edge of the stream
     #[arg(long)]
-    realm: Option<String>,
+    from_head: bool,
     /// Override the endpoint (for tests/proxies)
     #[arg(long)]
     base_url: Option<String>,
     /// Minimum milliseconds between requests
     #[arg(long, default_value_t = 500)]
     min_interval_ms: u64,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Realm {
+    Xbox,
+    Sony,
+}
+
+impl Realm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Realm::Xbox => "xbox",
+            Realm::Sony => "sony",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum CursorCommand {
+    /// Print the stored cursor
+    Show,
+    /// Store a cursor (a next_change_id)
+    Set { id: String },
+    /// Fetch the live edge from the trade site, store it and print it
+    Head,
 }
 
 #[derive(clap::Args)]
@@ -390,6 +426,7 @@ fn run() -> Result<()> {
                 base_url,
             } => ninja_fetch_cmd(&cfg, &league, types, all, no_currency, base_url),
         },
+        Command::Cursor { cmd } => run_cursor(&cfg, cmd),
         Command::Dump(args) => run_dump(&cfg, args),
         Command::Extract(args) => run_extract(&cfg, args),
         Command::Overlay(args) => run_overlay(&cfg, args),
@@ -481,9 +518,21 @@ fn make_client(cfg: &Config, token: &auth::Token, base_url: Option<String>) -> R
 
 fn watch(cfg: &Config, args: Watch) -> Result<()> {
     let mut store = open_market(cfg)?;
+    if let Some(id) = &args.from_id {
+        store.set_cursor(id)?;
+    } else if args.from_head {
+        store.set_cursor(&live_edge(cfg)?)?;
+    } else if store.next_change_id()?.is_none() {
+        bail!(
+            "no stream cursor yet: run with --from-head to start at the live edge, \
+             or --from-id <next_change_id> to start from a known page"
+        );
+    }
+
     let token = load_token(cfg, false)?;
     let mut client = make_client(cfg, &token, args.base_url.clone())?
         .with_min_interval(Duration::from_millis(args.min_interval_ms));
+    let realm = args.realm.map(Realm::as_str);
     let interval = Duration::from_secs(args.interval.unwrap_or(cfg.interval_secs));
     let mut pages = 0usize;
     let mut consecutive_errors = 0u32;
@@ -492,7 +541,7 @@ fn watch(cfg: &Config, args: Watch) -> Result<()> {
 
     loop {
         let cursor = store.next_change_id()?;
-        match client.fetch(cursor.as_deref(), args.realm.as_deref()) {
+        match client.fetch(cursor.as_deref(), realm) {
             Ok(page) => {
                 consecutive_errors = 0;
                 refreshed_token = false;
@@ -527,22 +576,40 @@ fn watch(cfg: &Config, args: Watch) -> Result<()> {
                 }
             }
             Err(e) => {
-                let text = e.to_string();
-                if text.contains("HTTP 400") && !reset_cursor {
-                    // A cursor the API no longer recognises: start over from the
-                    // head rather than dying. The gap is logged.
-                    tracing::warn!("cursor rejected by the API, restarting from the stream head");
-                    reset_cursor = true;
-                    store.clear_cursor()?;
+                if let Some(bad) = e.downcast_ref::<BadPage>() {
+                    let path = save_bad_page(&cfg.bad_pages_dir(), bad)?;
+                    match bad.next_change_id.as_deref() {
+                        Some(next) if Some(next) == cursor.as_deref() => {
+                            // The stream's last page is the bad one: wait for
+                            // it to move on rather than skipping ahead.
+                            tracing::warn!(
+                                "unparseable page at the end of the stream; saved to {}; waiting",
+                                path.display()
+                            );
+                            std::thread::sleep(interval);
+                            continue;
+                        }
+                        Some(next) => store.set_cursor(next)?,
+                        None => store.set_cursor(&live_edge(cfg)?)?,
+                    }
+                    tracing::warn!("skipped an unparseable page; saved to {}", path.display());
                     continue;
                 }
-                let auth_problem = text.contains("401") || text.contains("403");
-                if auth_problem && !refreshed_token {
-                    tracing::warn!("token rejected, refreshing and retrying once");
-                    refreshed_token = true;
-                    let token = load_token(cfg, true)?;
-                    client = make_client(cfg, &token, args.base_url.clone())?;
-                    continue;
+                if let Some(status) = e.downcast_ref::<HttpStatus>() {
+                    if status.code == 400 && !reset_cursor {
+                        reset_cursor = true;
+                        store.set_cursor(&live_edge(cfg)?)?;
+                        tracing::warn!(
+                            "cursor rejected; jumped to the live edge (pages in between are skipped)"
+                        );
+                        continue;
+                    }
+                    if matches!(status.code, 401 | 403) && !refreshed_token {
+                        refreshed_token = true;
+                        tracing::warn!("token rejected, refreshing and retrying once");
+                        client.set_token(load_token(cfg, true)?.access_token);
+                        continue;
+                    }
                 }
                 consecutive_errors += 1;
                 if consecutive_errors >= 10 {
@@ -554,6 +621,64 @@ fn watch(cfg: &Config, args: Watch) -> Result<()> {
             }
         }
     }
+}
+
+/// The live edge of the stream (a `next_change_id`), from the trade site.
+fn live_edge(cfg: &Config) -> Result<String> {
+    client::fetch_head(client::HEAD_URL, &head_user_agent(cfg))
+}
+
+/// The OAuth User-Agent when a client is configured, the plain one otherwise.
+fn head_user_agent(cfg: &Config) -> String {
+    match cfg.credentials() {
+        Ok((client_id, _)) => config::user_agent(client_id, &contact(cfg)),
+        Err(_) => config::app_user_agent(&contact(cfg)),
+    }
+}
+
+/// Keep an unparseable page for inspection: `bad_pages/<change_id>.json`.
+fn save_bad_page(dir: &std::path::Path, bad: &BadPage) -> Result<PathBuf> {
+    let id: String = bad
+        .change_id
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    let id = if id.is_empty() {
+        "head".to_string()
+    } else {
+        id
+    };
+    let path = dir.join(format!("{id}.json"));
+    if !path.exists() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::write(&path, &bad.body).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(path)
+}
+
+fn run_cursor(cfg: &Config, cmd: CursorCommand) -> Result<()> {
+    let mut store = open_market(cfg)?;
+    match cmd {
+        CursorCommand::Show => {
+            println!("{}", store.next_change_id()?.unwrap_or_else(|| "-".into()));
+        }
+        CursorCommand::Set { id } => {
+            let id = id.trim();
+            if id.is_empty() {
+                bail!("empty cursor");
+            }
+            store.set_cursor(id)?;
+            println!("{id}");
+        }
+        CursorCommand::Head => {
+            let id = live_edge(cfg)?;
+            store.set_cursor(&id)?;
+            println!("{id}");
+        }
+    }
+    Ok(())
 }
 
 fn short(change_id: &str) -> String {
