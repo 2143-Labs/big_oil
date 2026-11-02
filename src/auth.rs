@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::client::{agent, urlencode};
 use crate::config::user_agent;
 
 pub const TOKEN_URL: &str = "https://www.pathofexile.com/oauth/token";
@@ -84,12 +85,7 @@ pub fn request_token(client_id: &str, client_secret: &str, contact: &str) -> Res
         urlencode(client_secret),
         SCOPE
     );
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .new_agent();
-    let mut resp = agent
+    let mut resp = agent(std::time::Duration::from_secs(30))
         .post(TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("User-Agent", &user_agent(client_id, contact))
@@ -112,27 +108,9 @@ pub fn request_token(client_id: &str, client_secret: &str, contact: &str) -> Res
     Ok(token)
 }
 
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn urlencodes_form_values() {
-        assert_eq!(urlencode("a b+c/d"), "a%20b%2Bc%2Fd");
-    }
 
     #[test]
     fn cached_token_must_match_client() {

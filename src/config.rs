@@ -36,7 +36,7 @@ pub struct Config {
 
 impl Config {
     pub fn load(db_override: Option<PathBuf>) -> Result<Config> {
-        let config_dir = config_dir();
+        let config_dir = config_dir()?;
         let file_path = config_dir.join("config.json");
         let file: ConfigFile = match std::fs::read(&file_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -46,10 +46,13 @@ impl Config {
         };
 
         let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
-        let db_path = db_override
+        let db_path = match db_override
             .or_else(|| env("BIG_OIL_DB").map(PathBuf::from))
             .or(file.db_path)
-            .unwrap_or_else(default_db_path);
+        {
+            Some(path) => path,
+            None => data_dir()?.join("market.db"),
+        };
         let interval_secs = env("BIG_OIL_INTERVAL")
             .and_then(|v| v.parse().ok())
             .or(file.interval_secs)
@@ -118,41 +121,32 @@ impl Config {
     }
 }
 
-pub fn config_dir() -> PathBuf {
+pub fn config_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("BIG_OIL_CONFIG_DIR")
         && !dir.is_empty()
     {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
     }
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".config"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("big_oil")
+    dirs::config_dir()
+        .map(|d| d.join("big_oil"))
+        .context("cannot determine the config directory; set BIG_OIL_CONFIG_DIR")
 }
 
-pub fn default_db_path() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("big_oil").join("market.db")
+/// Where the databases live by default (`$XDG_DATA_HOME/big_oil`).
+pub fn data_dir() -> Result<PathBuf> {
+    dirs::data_dir()
+        .map(|d| d.join("big_oil"))
+        .context("cannot determine the data directory; set BIG_OIL_DB and BIG_OIL_OWN_DB")
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn user_agent(client_id: &str, contact: &str) -> String {
     format!("OAuth {client_id}/{VERSION} (contact: {contact}) big_oil")
+}
+
+/// User-Agent for calls that are not made with an OAuth client (poe.ninja, the
+/// website's own stash endpoint).
+pub fn app_user_agent(contact: &str) -> String {
+    format!("big_oil/{VERSION} (contact: {contact})")
 }

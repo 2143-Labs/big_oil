@@ -10,18 +10,51 @@ pub fn ts(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
-/// Compact age, e.g. `42s`, `17m`, `3h`, `12d`.
+/// Compact age, e.g. `42s`, `17m`, `3h`, `12d`; `?` for a time in the future.
 pub fn age(unix: i64) -> String {
     let secs = crate::store::unix_now() - unix;
     if secs < 0 {
         return "?".into();
     }
-    match secs {
-        0..=59 => format!("{secs}s"),
-        60..=3599 => format!("{}m", secs / 60),
-        3600..=86_399 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86_400),
+    duration(secs)
+}
+
+/// Compact duration, e.g. `42s`, `17m`, `3h`, `12d`. Negative values clamp to 0.
+pub fn duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
     }
+}
+
+/// A number for humans: whole numbers without decimals, large numbers rounded,
+/// everything else to at most two decimals (`1.35`, `1.5`, `120`, `1235`).
+pub fn num(v: f64) -> String {
+    if !v.is_finite() {
+        return v.to_string();
+    }
+    if (v - v.round()).abs() < 1e-9 {
+        return format!("{}", v.round() as i64);
+    }
+    if v.abs() >= 100.0 {
+        return format!("{v:.0}");
+    }
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Replace control characters (escape sequences, newlines) so text from the
+/// API cannot rewrite the terminal.
+pub fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// Render a left-aligned table. Cells longer than `max` are ellipsised so one
@@ -30,6 +63,11 @@ pub fn table(headers: &[&str], rows: &[Vec<String>], max: usize) -> String {
     if rows.is_empty() {
         return String::new();
     }
+    let headers: Vec<String> = headers.iter().map(|h| clean(h)).collect();
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| clean(c)).collect())
+        .collect();
     let widths: Vec<usize> = headers
         .iter()
         .enumerate()
@@ -70,7 +108,7 @@ pub fn table(headers: &[&str], rows: &[Vec<String>], max: usize) -> String {
         &mut out,
     );
     for row in rows {
-        push(row.clone(), &mut out);
+        push(row, &mut out);
     }
     out
 }
@@ -112,5 +150,24 @@ mod tests {
         let out = table(&["a", "b"], &[vec!["x".repeat(80), "short".into()]], 10);
         assert!(out.contains('…'));
         assert!(out.contains("short"));
+    }
+
+    #[test]
+    fn formats_numbers_for_humans() {
+        assert_eq!(num(1.35), "1.35");
+        assert_eq!(num(1.5), "1.5");
+        assert_eq!(num(120.0), "120");
+        assert_eq!(num(1234.6), "1235");
+    }
+
+    #[test]
+    fn cleans_control_characters() {
+        assert_eq!(clean("a\u{1b}[31mb"), "a\u{FFFD}[31mb");
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(duration(1800), "30m");
+        assert_eq!(duration(-5), "0s");
     }
 }

@@ -1,12 +1,13 @@
 //! Own-stash ingestion, valuation, and schema migration.
 
+mod support;
+
 use big_oil::model::Item;
 use big_oil::ninja::PriceLine;
 use big_oil::own::OwnClient;
 use big_oil::store::{SearchQuery, Store, unix_now};
 use serde_json::json;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use support::{mock, response};
 
 fn item(value: serde_json::Value) -> Item {
     Item::from_value(&value)
@@ -239,36 +240,12 @@ fn opens_a_v1_database_and_migrates_it() {
 
 // --- mock endpoint for the own-stash client ---
 
-fn response(body: &str) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-}
-
-fn read_request(stream: &mut TcpStream) -> String {
-    let mut buf = [0u8; 4096];
-    let mut req = Vec::new();
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                req.extend_from_slice(&buf[..n]);
-                if req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&req).into_owned()
+fn ok_json(body: &str) -> String {
+    response("200 OK", &[("Content-Type", "application/json")], body)
 }
 
 #[test]
 fn client_sends_session_cookie_and_tab_params() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = format!("http://{}", listener.local_addr().unwrap());
-
     let tabs_body = json!({
         "numTabs": 2,
         "tabs": [
@@ -287,17 +264,7 @@ fn client_sends_session_cookie_and_tab_params() {
         ]
     })
     .to_string();
-
-    let handle = std::thread::spawn(move || {
-        let mut requests = Vec::new();
-        for body in [tabs_body, items_body] {
-            let (mut stream, _) = listener.accept().unwrap();
-            requests.push(read_request(&mut stream));
-            stream.write_all(response(&body).as_bytes()).unwrap();
-            stream.flush().unwrap();
-        }
-        requests
-    });
+    let (addr, handle) = mock(vec![ok_json(&tabs_body), ok_json(&items_body)]);
 
     let client = OwnClient::with_base(&addr, "session-cookie-value", "me@example.com");
     let tabs = client.tabs("Tester#1234", "Standard").unwrap();

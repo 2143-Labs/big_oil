@@ -111,18 +111,12 @@ impl Calibration {
         })
     }
 
-    pub fn default_little_oil_path() -> PathBuf {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("little_oil").join("config.json")
+    pub fn default_little_oil_path() -> Result<PathBuf> {
+        dirs::config_dir()
+            .map(|d| d.join("little_oil").join("config.json"))
+            .context(
+                "cannot determine the config directory; pass --config <little_oil config.json>",
+            )
     }
 
     /// Screen rectangle of an item occupying `w`×`h` cells at `(x, y)`.

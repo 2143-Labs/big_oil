@@ -685,9 +685,9 @@ fn show_item(cfg: &Config, id: &str, json: bool) -> Result<()> {
             println!(
                 "    {}  {} chaos{} ({})",
                 render::ts(v.at),
-                v.chaos.map(trim_num).unwrap_or_else(|| "?".into()),
+                v.chaos.map(render::num).unwrap_or_else(|| "?".into()),
                 v.divine
-                    .map(|d| format!(" / {} divine", trim_num(d)))
+                    .map(|d| format!(" / {} divine", render::num(d)))
                     .unwrap_or_default(),
                 v.matched.clone().unwrap_or_default()
             );
@@ -814,20 +814,10 @@ fn contact(cfg: &Config) -> String {
     cfg.contact.clone().unwrap_or_else(|| "unset".to_string())
 }
 
-fn trim_num(v: f64) -> String {
-    if (v.fract()).abs() < f64::EPSILON {
-        format!("{}", v as i64)
-    } else if v.abs() >= 100.0 {
-        format!("{v:.0}")
-    } else {
-        format!("{v:.2}")
-    }
-}
-
 fn value_cell(row: &store::ItemRow) -> String {
     match (row.value_chaos, row.value_divine) {
-        (Some(c), Some(d)) => format!("{}c / {}d", trim_num(c), trim_num(d)),
-        (Some(c), None) => format!("{}c", trim_num(c)),
+        (Some(c), Some(d)) => format!("{}c / {}d", render::num(c), render::num(d)),
+        (Some(c), None) => format!("{}c", render::num(c)),
         _ => "-".into(),
     }
 }
@@ -1091,8 +1081,8 @@ fn stash_list(cfg: &Config) -> Result<()> {
                 t.league.clone(),
                 t.items.to_string(),
                 t.live.to_string(),
-                trim_num(t.value_chaos),
-                trim_num(t.value_divine),
+                render::num(t.value_chaos),
+                render::num(t.value_divine),
                 t.last_seen.map(render::age).unwrap_or_else(|| "-".into()),
             ]
         })
@@ -1111,8 +1101,8 @@ fn stash_list(cfg: &Config) -> Result<()> {
     let divine: f64 = tabs.iter().map(|t| t.value_divine).sum();
     println!(
         "total: {} chaos / {} divine across {} tabs",
-        trim_num(chaos),
-        trim_num(divine),
+        render::num(chaos),
+        render::num(divine),
         tabs.len()
     );
     Ok(())
@@ -1210,7 +1200,7 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                         String::new()
                     },
                     at,
-                    fmt_duration(t.oldest_secs),
+                    render::duration(t.oldest_secs),
                     t.suggested.clone().unwrap_or_else(|| "-".into()),
                     chaos_cell(t.value_chaos),
                     if t.underpriced > 0 {
@@ -1256,7 +1246,7 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                     f.listed.clone().unwrap_or_else(|| "-".into()),
                     f.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
                     f.loss_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
-                    fmt_duration(f.age_secs),
+                    render::duration(f.age_secs),
                 ]
             })
             .collect());
@@ -1288,7 +1278,7 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                     f.name.clone(),
                     f.tab.clone().unwrap_or_default(),
                     f.value_chaos.map(chaos_cell).unwrap_or_else(|| "-".into()),
-                    fmt_duration(f.age_secs),
+                    render::duration(f.age_secs),
                 ]
             })
             .collect());
@@ -1309,7 +1299,7 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
             if settings.cut_abs.is_some() {
                 format!(
                     "step down {}",
-                    trim_num(settings.cut_abs.unwrap_or_default())
+                    render::num(settings.cut_abs.unwrap_or_default())
                 )
             } else {
                 format!("cut {}%", settings.cut_pct.round() as i64)
@@ -1324,7 +1314,7 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
                     f.tab.clone().unwrap_or_default(),
                     f.listed.clone().unwrap_or_else(|| "-".into()),
                     f.suggested.clone().unwrap_or_else(|| "-".into()),
-                    fmt_duration(f.age_secs),
+                    render::duration(f.age_secs),
                 ]
             })
             .collect());
@@ -1387,20 +1377,7 @@ fn notify_user(summary: &str) {
 }
 
 fn chaos_cell(value: f64) -> String {
-    format!("{}c", trim_num(value))
-}
-
-fn fmt_duration(secs: i64) -> String {
-    let secs = secs.max(0);
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
+    format!("{}c", render::num(value))
 }
 
 fn run_extract(cfg: &Config, args: ExtractArgs) -> Result<()> {
@@ -1441,7 +1418,7 @@ fn print_extract(report: &extract::Report) {
         return;
     }
     let price = match (&report.tab_price, report.tab_price_chaos) {
-        (Some(p), Some(c)) => format!("{p} (~{}c)", trim_num(c)),
+        (Some(p), Some(c)) => format!("{p} (~{}c)", render::num(c)),
         (Some(p), None) => p.clone(),
         _ => "unpriced".to_string(),
     };
@@ -1539,10 +1516,10 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
         ..Default::default()
     })?;
 
-    let path = args
-        .config
-        .clone()
-        .unwrap_or_else(Calibration::default_little_oil_path);
+    let path = match args.config.clone() {
+        Some(path) => path,
+        None => Calibration::default_little_oil_path()?,
+    };
     let calibration = Calibration::from_little_oil(&path)?;
 
     let settings = overlay::Settings {

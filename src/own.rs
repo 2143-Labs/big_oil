@@ -12,7 +12,8 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::config::VERSION;
+use crate::client::{agent, urlencode};
+use crate::config::app_user_agent;
 use crate::model::Item;
 
 pub const BASE: &str = "https://www.pathofexile.com";
@@ -55,16 +56,11 @@ impl OwnClient {
     }
 
     pub fn with_base(base: impl Into<String>, cookie: impl Into<String>, contact: &str) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(std::time::Duration::from_secs(45)))
-            .build()
-            .new_agent();
         OwnClient {
-            agent,
+            agent: agent(std::time::Duration::from_secs(45)),
             base: base.into(),
             cookie: cookie.into(),
-            user_agent: format!("big_oil/{VERSION} (contact: {contact})"),
+            user_agent: app_user_agent(contact),
         }
     }
 
@@ -138,24 +134,12 @@ impl OwnClient {
 
 fn truncate(body: &str, max: usize) -> String {
     let body = body.trim();
-    if body.len() <= max {
+    let cut: String = body.chars().take(max).collect();
+    if cut.len() == body.len() {
         body.to_owned()
     } else {
-        format!("{}…", &body[..max])
+        cut + "…"
     }
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 pub fn parse_tab_list(value: &Value) -> Result<TabList> {
@@ -246,5 +230,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unauthorized"));
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        let body = "é".repeat(300);
+        let cut = truncate(&body, 200);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cut.chars().count(), 201);
     }
 }

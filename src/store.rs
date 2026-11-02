@@ -264,7 +264,12 @@ impl ItemRow {
         let amount = self.price_amount?;
         let currency = self.price_currency.clone().unwrap_or_default();
         let kind = self.price_type.clone().unwrap_or_else(|| "b/o".into());
-        Some(format!("{} {} {}", kind, trim_num(amount), currency))
+        Some(format!(
+            "{} {} {}",
+            kind,
+            crate::render::num(amount),
+            currency
+        ))
     }
 
     pub fn display_name(&self) -> String {
@@ -274,14 +279,6 @@ impl ItemRow {
             (_, Some(t)) => t.clone(),
             _ => "<unnamed>".into(),
         }
-    }
-}
-
-fn trim_num(v: f64) -> String {
-    if (v.fract()).abs() < f64::EPSILON {
-        format!("{}", v as i64)
-    } else {
-        format!("{v}")
     }
 }
 

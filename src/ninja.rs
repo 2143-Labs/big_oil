@@ -10,6 +10,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::client::{agent, urlencode};
+use crate::config::app_user_agent;
+
 pub const BASE: &str = "https://poe.ninja";
 
 /// PoE 1 item-overview categories. Fetching all of them is several MB per
@@ -146,15 +149,10 @@ impl NinjaClient {
     }
 
     pub fn with_base(base: impl Into<String>, contact: &str) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(std::time::Duration::from_secs(90)))
-            .build()
-            .new_agent();
         NinjaClient {
-            agent,
+            agent: agent(std::time::Duration::from_secs(90)),
             base: base.into(),
-            user_agent: format!("big_oil/{} (contact: {contact})", crate::config::VERSION),
+            user_agent: app_user_agent(contact),
         }
     }
 
@@ -242,19 +240,6 @@ impl NinjaClient {
         let body = resp.body_mut().read_to_string().unwrap_or_default();
         Ok((status, body, new_etag))
     }
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 fn line_value(v: &Value, key: &str) -> Option<f64> {

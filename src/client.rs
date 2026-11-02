@@ -176,12 +176,8 @@ impl Client {
         contact: &str,
         client_id: &str,
     ) -> Self {
-        let agent = ureq::Agent::config_builder()
-            // We inspect status codes ourselves: 429 has meaning beyond "error".
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build()
-            .new_agent();
+        // We inspect status codes ourselves: 429 has meaning beyond "error".
+        let agent = agent(Duration::from_secs(60));
         Client {
             agent,
             base: base.into(),
@@ -302,7 +298,18 @@ impl Client {
     }
 }
 
-fn urlencode(s: &str) -> String {
+/// An HTTP agent that leaves status handling to the caller (429 has meaning
+/// beyond "error") and gives up after `timeout`.
+pub fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .new_agent()
+}
+
+/// Percent-encode a query or form value (RFC 3986 unreserved set kept).
+pub fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {
@@ -318,6 +325,11 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn urlencodes_form_values() {
+        assert_eq!(urlencode("a b+c/d"), "a%20b%2Bc%2Fd");
+    }
 
     #[test]
     fn parses_policy_headers() {
