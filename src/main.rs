@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,10 +20,10 @@ use big_oil::listing::{self, Rule, TabSelector};
 use big_oil::model::StashPage;
 use big_oil::ninja::{self, NinjaClient, Overview};
 use big_oil::overlay::{self, Calibration};
-use big_oil::own::OwnClient;
+use big_oil::own::{self, OwnClient, SessionExpired};
 use big_oil::rates::Rates;
 use big_oil::render;
-use big_oil::store::{self, Order, OwnTab, SearchQuery, Store};
+use big_oil::store::{self, Order, SearchQuery, Store};
 
 #[derive(Parser)]
 #[command(
@@ -191,15 +192,13 @@ struct StashWatch {
     /// One pass, then exit
     #[arg(long)]
     once: bool,
-    /// Seconds between passes (each pass re-reads every scanned tab)
-    #[arg(long, default_value_t = 300)]
+    /// Seconds between passes (each pass re-reads the tab list and every
+    /// selected tab; at least 30)
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(30..))]
     interval: u64,
-    /// Comma-separated tab indexes to scan (default: every visible tab)
-    #[arg(long)]
-    tabs: Option<String>,
-    /// Only tabs whose name contains this text (e.g. your dump tab)
-    #[arg(long)]
-    tab_name: Option<String>,
+    /// Tab index or name substring to scan; repeat for more (default: every visible tab)
+    #[arg(long = "tab", value_name = "TAB")]
+    tabs: Vec<String>,
     /// Refresh poe.ninja prices before the first pass
     #[arg(long)]
     refresh_prices: bool,
@@ -209,10 +208,15 @@ struct StashWatch {
     /// Refresh prices when older than this many seconds
     #[arg(long, default_value_t = 1800)]
     price_interval: u64,
-    /// Override the endpoint (for tests/proxies)
+    /// Override the stash endpoint (for tests/proxies)
     #[arg(long)]
     base_url: Option<String>,
-    /// Desktop notification when something needs attention
+    /// Override the poe.ninja endpoint (for tests/proxies)
+    #[arg(long)]
+    ninja_base_url: Option<String>,
+    #[command(flatten)]
+    rule: RuleArgs,
+    /// Desktop notification when something new is underpriced
     #[arg(long)]
     notify: bool,
 }
@@ -896,14 +900,6 @@ fn value_cell(row: &store::ItemRow) -> String {
     }
 }
 
-fn parse_tab_filter(raw: &Option<String>) -> Option<Vec<i64>> {
-    raw.as_ref().map(|spec| {
-        spec.split(',')
-            .filter_map(|p| p.trim().parse::<i64>().ok())
-            .collect()
-    })
-}
-
 fn selected_types(all: bool) -> Vec<String> {
     if all {
         ninja::all_item_types()
@@ -1023,18 +1019,24 @@ fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
     let account = cfg.account.clone().with_context(|| {
         "no account configured: set BIG_OIL_ACCOUNT or \"account\" in the config file (Name#1234)"
     })?;
+    let selectors = args
+        .tabs
+        .iter()
+        .map(|raw| TabSelector::parse(raw))
+        .collect::<Result<Vec<_>>>()?;
+    let rule = args.rule.rule();
 
     let mut store = open_own(cfg)?;
-    let client = OwnClient::with_base(
+    let mut client = OwnClient::with_base(
         args.base_url
             .clone()
             .unwrap_or_else(|| big_oil::own::BASE.to_string()),
         cookie,
         &contact(cfg),
     );
-    let filter = parse_tab_filter(&args.tabs);
     let item_types = selected_types(args.all);
     let mut first = true;
+    let mut notified: HashSet<String> = HashSet::new();
 
     loop {
         let stale = match store.priced_at(&args.league)? {
@@ -1048,7 +1050,7 @@ fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
                 &args.league,
                 &item_types,
                 true,
-                args.base_url.clone(),
+                args.ninja_base_url.clone(),
             ) {
                 Ok((lines, categories)) => {
                     tracing::info!(lines, categories, "price snapshot refreshed")
@@ -1057,10 +1059,44 @@ fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
             }
         }
 
-        match stash_pass(&mut store, &client, &account, &args, filter.as_deref()) {
-            Ok(drops) => {
+        let started = store::unix_now();
+        match own::scan(&mut store, &mut client, &account, &args.league, &selectors) {
+            Ok(report) => {
+                for (tab, error) in &report.failed {
+                    tracing::warn!(tab = %tab, error = %error, "tab skipped this pass");
+                }
+                let valued = store.value_items(&args.league)?;
+                tracing::info!(
+                    tabs = report.scanned.len(),
+                    total_tabs = report.total_tabs,
+                    dropped = report.dropped,
+                    removed = report.removed,
+                    closed_tabs = report.closed_tabs,
+                    valued,
+                    "pass complete"
+                );
+                let drops = store.search(&SearchQuery {
+                    league: Some(args.league.clone()),
+                    since: Some(started),
+                    order: Order::Newest,
+                    limit: 100,
+                    ..Default::default()
+                })?;
                 print_drops(&drops);
-                alert_dump(&store, &args.league, args.notify);
+                alert(
+                    &store,
+                    &args.league,
+                    &rule,
+                    &report.scanned,
+                    &mut notified,
+                    args.notify,
+                );
+            }
+            Err(e) if e.downcast_ref::<SessionExpired>().is_some() => {
+                if args.notify {
+                    notify_user("big_oil: stash watch stopped", &e.to_string());
+                }
+                return Err(e);
             }
             Err(e) if args.once => return Err(e),
             Err(e) => tracing::warn!(error = %e, interval = args.interval, "pass failed"),
@@ -1072,75 +1108,6 @@ fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
         }
         std::thread::sleep(Duration::from_secs(args.interval));
     }
-}
-
-fn stash_pass(
-    store: &mut Store,
-    client: &OwnClient,
-    account: &str,
-    args: &StashWatch,
-    filter: Option<&[i64]>,
-) -> Result<Vec<store::ItemRow>> {
-    let started = store::unix_now();
-    let tabs = client.tabs(account, &args.league)?;
-    let mut scanned = 0usize;
-
-    for tab in &tabs.tabs {
-        if tab.hidden {
-            continue;
-        }
-        if let Some(filter) = filter
-            && !filter.contains(&tab.index)
-        {
-            continue;
-        }
-        if let Some(name) = &args.tab_name
-            && !tab
-                .name
-                .to_ascii_lowercase()
-                .contains(&name.to_ascii_lowercase())
-        {
-            continue;
-        }
-        let items = client.tab(account, &args.league, tab.index)?;
-        let stash_id = tab.stash_id(&args.league);
-        let stats = store.ingest_own_tab(
-            &OwnTab {
-                stash_id: &stash_id,
-                index: tab.index,
-                name: &tab.name,
-                stash_type: &tab.kind,
-                league: &args.league,
-                account: Some(account),
-            },
-            &items,
-        )?;
-        scanned += 1;
-        if stats.items_new > 0 || stats.delisted > 0 {
-            tracing::info!(
-                tab = %tab.name,
-                dropped = stats.items_new,
-                removed = stats.delisted,
-                "tab changed"
-            );
-        }
-    }
-
-    let valued = store.value_items(&args.league)?;
-    let drops = store.search(&SearchQuery {
-        since: Some(started),
-        order: Order::Newest,
-        limit: 100,
-        ..Default::default()
-    })?;
-    tracing::info!(
-        tabs = scanned,
-        total_tabs = tabs.tabs.len(),
-        valued,
-        new = drops.len(),
-        "pass complete"
-    );
-    Ok(drops)
 }
 
 fn print_drops(rows: &[store::ItemRow]) {
@@ -1254,7 +1221,7 @@ fn run_dump(cfg: &Config, args: DumpArgs) -> Result<()> {
         print_report(&report, &settings);
     }
     if args.notify {
-        notify_user(&report.summary());
+        notify_user("big_oil", &report.summary());
     }
     Ok(())
 }
@@ -1340,35 +1307,53 @@ fn print_report(report: &dump::Report, settings: &DumpSettings) {
     println!("{}", report.summary());
 }
 
-/// Called after each stash pass so the reminder is impossible to miss.
-fn alert_dump(store: &Store, league: &str, notify: bool) {
+/// After each pass: say so when something is newly underpriced in the tabs
+/// just scanned. Items already reported stay quiet until they drop out.
+fn alert(
+    store: &Store,
+    league: &str,
+    rule: &Rule,
+    scanned: &[String],
+    notified: &mut HashSet<String>,
+    notify: bool,
+) {
     let Ok(rates) = store.rates(league) else {
         return;
     };
-    let rows = match store.own_rows(league) {
-        Ok(rows) => rows,
+    let rows: Vec<store::ItemRow> = match store.own_rows(league) {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|r| scanned.contains(&r.stash_id))
+            .collect(),
         Err(e) => {
             tracing::warn!(error = %e, "dump check failed");
             return;
         }
     };
-    let report = dump::analyze(&rows, &rates, store::unix_now(), &DumpSettings::default());
-    if report.is_quiet() {
-        return;
+    let settings = DumpSettings {
+        tab: None,
+        rule: *rule,
+    };
+    let report = dump::analyze(&rows, &rates, store::unix_now(), &settings);
+    let current: HashSet<String> = report.underpriced.iter().map(|f| f.id.clone()).collect();
+    if current.iter().any(|id| !notified.contains(id)) {
+        let summary = report.summary();
+        println!("dump: {summary}");
+        if notify {
+            notify_user("big_oil", &summary);
+        }
     }
-    println!("dump: {}", report.summary());
-    if notify {
-        notify_user(&report.summary());
-    }
+    *notified = current;
 }
 
-fn notify_user(summary: &str) {
-    match std::process::Command::new("notify-send")
-        .args(["-u", "critical", "-a", "big_oil", "Dump tab", summary])
+fn notify_user(title: &str, body: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Err(e) = std::process::Command::new("notify-send")
+        .args(["-u", "normal", "-a", "big_oil", title, body])
         .status()
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
-        Ok(_) => {}
-        Err(e) => tracing::debug!(error = %e, "notify-send unavailable"),
+        tracing::warn!(error = %e, "notify-send failed; desktop notifications are off");
     }
 }
 

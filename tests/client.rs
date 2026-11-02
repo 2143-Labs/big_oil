@@ -59,7 +59,10 @@ fn honours_retry_after_on_429() {
                 ("Retry-After", "1"),
                 ("X-Rate-Limit-Rules", "Ip"),
                 ("X-Rate-Limit-Ip", "6:12:60"),
-                ("X-Rate-Limit-Ip-State", "6:12:0"),
+                // One hit (this request), so only Retry-After decides the
+                // wait; a full window would add its own (tested in the unit
+                // tests).
+                ("X-Rate-Limit-Ip-State", "1:12:0"),
             ],
             "",
         ),

@@ -722,6 +722,44 @@ impl Store {
         Ok(stats)
     }
 
+    /// Close every open own tab in `league` whose stash id is not in `present`
+    /// (the account's current tab list): its items get `removed` events and the
+    /// tab leaves `own_tabs`. Returns how many tabs were closed.
+    pub fn close_missing_own_tabs(
+        &mut self,
+        league: &str,
+        present: &HashSet<String>,
+    ) -> Result<usize> {
+        let open: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM stashes
+                 WHERE source = 'own' AND league = ?1 AND delisted_at IS NULL",
+            )?;
+            stmt.query_map([league], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        let now = unix_now();
+        let tx = self.conn.transaction()?;
+        let mut stats = IngestStats::default();
+        let mut closed = 0;
+        for id in open.into_iter().filter(|id| !present.contains(id)) {
+            let gone = Stash {
+                id,
+                public: false,
+                account: None,
+                name: None,
+                stash_type: None,
+                league: None,
+                index: None,
+                items: Vec::new(),
+            };
+            ingest_stash(&tx, &gone, Origin::Own, "", now, &mut stats)?;
+            closed += 1;
+        }
+        tx.commit()?;
+        Ok(closed)
+    }
+
     /// Replace the stored economy lines for `(league, category)`.
     pub fn upsert_price_lines(
         &mut self,

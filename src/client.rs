@@ -46,18 +46,18 @@ impl RateLimiter {
         self
     }
 
-    fn note(&mut self) {
+    pub(crate) fn note(&mut self) {
         self.sent.push_back(Instant::now());
     }
 
     /// True when a 429 told us to wait (so the loop must not invent its own
     /// backoff on top).
-    fn is_restricted(&self) -> bool {
+    pub(crate) fn is_restricted(&self) -> bool {
         self.restricted_until.is_some_and(|t| t > Instant::now())
     }
 
     /// How long we must wait before the next request is within every limit.
-    fn delay(&mut self) -> Duration {
+    pub(crate) fn delay(&mut self) -> Duration {
         let now = Instant::now();
         let longest_period = self
             .limits
@@ -103,8 +103,7 @@ impl RateLimiter {
         wait
     }
 
-    fn observe(&mut self, resp: &ureq::http::Response<ureq::Body>) {
-        let headers = resp.headers();
+    pub(crate) fn observe(&mut self, headers: &ureq::http::HeaderMap) {
         let header = |name: &str| -> Option<String> {
             headers
                 .get(name)
@@ -127,14 +126,24 @@ impl RateLimiter {
                 limits.extend(parse_limits(&value));
             }
             if let Some(state) = header(&format!("x-rate-limit-{rule}-state")) {
+                let state = parse_limits(&state);
                 // `active` (third field) means this rule is currently restricting us.
-                if let Some(active) = parse_limits(&state)
-                    .iter()
-                    .map(|l| l.restrict)
-                    .max()
-                    .filter(|v| *v > 0)
-                {
+                if let Some(active) = state.iter().map(|l| l.restrict).max().filter(|v| *v > 0) {
                     self.restricted_until = Some(Instant::now() + Duration::from_secs(active));
+                }
+                // The server counts requests we did not see (another process,
+                // an earlier run): adopt its count so we do not overshoot.
+                for window in &state {
+                    let now = Instant::now();
+                    let span = Duration::from_secs(window.period);
+                    let local = self
+                        .sent
+                        .iter()
+                        .filter(|t| now.duration_since(**t) < span)
+                        .count() as u32;
+                    for _ in local..window.max {
+                        self.sent.push_back(now);
+                    }
                 }
             }
         }
@@ -241,7 +250,7 @@ impl Client {
                     continue;
                 }
             };
-            self.limiter.observe(&resp);
+            self.limiter.observe(resp.headers());
 
             let status = resp.status().as_u16();
             match status {
@@ -372,5 +381,20 @@ mod tests {
         limiter.note();
         let wait = limiter.delay();
         assert!(wait > Duration::from_millis(100) && wait <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn adopts_the_servers_hit_count() {
+        use ureq::http::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rate-limit-rules", HeaderValue::from_static("Ip"));
+        headers.insert("x-rate-limit-ip", HeaderValue::from_static("6:60:60"));
+        headers.insert("x-rate-limit-ip-state", HeaderValue::from_static("5:60:0"));
+
+        let mut limiter = RateLimiter::new().with_min_interval(Duration::ZERO);
+        limiter.observe(&headers);
+        assert!(limiter.delay().is_zero(), "one request left in the window");
+        limiter.note();
+        assert!(limiter.delay() > Duration::from_secs(50));
     }
 }

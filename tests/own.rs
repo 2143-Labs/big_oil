@@ -4,9 +4,11 @@ mod support;
 
 use big_oil::model::Item;
 use big_oil::ninja::PriceLine;
-use big_oil::own::OwnClient;
+use big_oil::own::{self, OwnClient, SessionExpired};
 use big_oil::store::{OwnTab, SearchQuery, Store, unix_now};
 use serde_json::json;
+use std::collections::HashSet;
+use std::time::Duration;
 use support::{mock, response};
 
 fn tab<'a>(id: &'a str, name: &'a str) -> OwnTab<'a> {
@@ -279,7 +281,8 @@ fn client_sends_session_cookie_and_tab_params() {
     .to_string();
     let (addr, handle) = mock(vec![ok_json(&tabs_body), ok_json(&items_body)]);
 
-    let client = OwnClient::with_base(&addr, "session-cookie-value", "me@example.com");
+    let mut client = OwnClient::with_base(&addr, "session-cookie-value", "me@example.com")
+        .with_min_interval(Duration::ZERO);
     let tabs = client.tabs("Tester#1234", "Standard").unwrap();
     assert_eq!(tabs.tabs.len(), 2);
     assert!(tabs.tabs[1].hidden);
@@ -292,6 +295,93 @@ fn client_sends_session_cookie_and_tab_params() {
     ));
     assert!(requests[1].contains("tabs=0&tabIndex=0"));
     assert!(requests[0].contains("cookie: POESESSID=session-cookie-value"));
+}
+
+#[test]
+fn scan_skips_failing_tabs_and_reuses_tab_zero() {
+    let list = json!({
+        "numTabs": 3,
+        "tabs": [
+            {"n": "Dump", "i": 0, "id": "t0", "type": "QuadStash"},
+            {"n": "Broken", "i": 1, "id": "t1", "type": "PremiumStash"},
+            {"n": "Maps", "i": 2, "id": "t2", "type": "PremiumStash"}
+        ],
+        "items": [
+            {"id": "h1", "name": "Headhunter", "typeLine": "Leather Belt",
+             "baseType": "Leather Belt", "frameType": 3}
+        ]
+    })
+    .to_string();
+    let tab2 = json!({"items": [
+        {"id": "c1", "typeLine": "Chaos Orb", "baseType": "Chaos Orb", "frameType": 5}
+    ]})
+    .to_string();
+    let (addr, handle) = mock(vec![
+        ok_json(&list),
+        response("500 Internal Server Error", &[], "oops"),
+        ok_json(&tab2),
+    ]);
+
+    let mut store = Store::open_memory().unwrap();
+    let mut client =
+        OwnClient::with_base(&addr, "cookie", "me@example.com").with_min_interval(Duration::ZERO);
+    let report = own::scan(&mut store, &mut client, "Tester#1", "Standard", &[]).unwrap();
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 3, "tab 0 comes with the list");
+    assert!(requests[1].contains("tabIndex=1 "), "{}", requests[1]);
+    assert!(requests[2].contains("tabIndex=2 "), "{}", requests[2]);
+    assert_eq!(report.total_tabs, 3);
+    assert_eq!(report.scanned, vec!["t0", "t2"]);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, "Broken");
+    assert_eq!(report.dropped, 2);
+
+    let belt = store.item("h1").unwrap().unwrap();
+    assert_eq!(belt.stash_id, "t0");
+    assert_eq!(belt.tab_index, Some(0));
+    assert_eq!(belt.stash_type.as_deref(), Some("QuadStash"));
+}
+
+#[test]
+fn expired_session_is_typed() {
+    let (addr, handle) = mock(vec![response("403 Forbidden", &[], "")]);
+    let mut client =
+        OwnClient::with_base(&addr, "cookie", "me@example.com").with_min_interval(Duration::ZERO);
+    let err = client.tabs("Tester#1", "Standard").unwrap_err();
+    assert!(err.downcast_ref::<SessionExpired>().is_some(), "{err:#}");
+    assert!(err.to_string().contains("POESESSID"));
+    handle.join().unwrap();
+}
+
+#[test]
+fn deleted_tabs_are_closed() {
+    let mut store = Store::open_memory().unwrap();
+    store
+        .ingest_own_tab(&tab("a", "A"), &[headhunter()])
+        .unwrap();
+    store
+        .ingest_own_tab(&tab("b", "B"), &[chaos_orb()])
+        .unwrap();
+
+    let present: HashSet<String> = ["a".to_string()].into();
+    assert_eq!(
+        store.close_missing_own_tabs("Standard", &present).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.history("c1").unwrap().last().unwrap().event,
+        "removed"
+    );
+    let tabs = store.own_tabs().unwrap();
+    assert_eq!(tabs.len(), 1);
+    assert_eq!(tabs[0].stash_id, "a");
+
+    // Closing is idempotent.
+    assert_eq!(
+        store.close_missing_own_tabs("Standard", &present).unwrap(),
+        0
+    );
 }
 
 #[test]
