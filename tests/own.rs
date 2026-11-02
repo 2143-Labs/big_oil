@@ -55,6 +55,7 @@ fn line(name: &str, base: Option<&str>, chaos: f64) -> PriceLine {
         listing_count: Some(10),
         details_id: None,
         fetched_at: unix_now(),
+        ..Default::default()
     }
 }
 

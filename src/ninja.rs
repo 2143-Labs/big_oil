@@ -2,9 +2,15 @@
 //!
 //! These endpoints are documented as the supported public surface
 //! (<https://poe.ninja/docs/api>), need no auth, and are served with ETags and
-//! a ~5 minute cache; the underlying PoE 1 data refreshes roughly every 15
-//! minutes. They price *item types*, not individual listings, which is exactly
-//! what an offline valuation of your own tabs needs.
+//! `cache-control: max-age=1800`; the underlying PoE 1 data refreshes roughly
+//! every 15 minutes. They price *item types*, not individual listings, which
+//! is exactly what an offline valuation of your own tabs needs.
+//!
+//! Two shapes: the stash item overview (uniques, gems, maps, bases), and the
+//! exchange overview for everything traded in bulk (currency, fragments,
+//! scarabs, cards, …).
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -48,25 +54,27 @@ pub const POE1_ITEM_TYPES: &[&str] = &[
     "IncursionTemple",
 ];
 
-/// Currency-overview categories (currency-like items, one `currencyTypeName`
-/// per line).
-pub const POE1_CURRENCY_TYPES: &[&str] = &[
+/// Exchange-overview categories: everything priced by the currency exchange.
+/// (The stash currency overview only serves Currency and Fragment.)
+pub const POE1_EXCHANGE_TYPES: &[&str] = &[
     "Currency",
     "Fragment",
-    "Tattoo",
-    "Omen",
-    "Oil",
-    "Fossil",
-    "Resonator",
-    "Scarab",
-    "Astrolabe",
-    "DeliriumOrb",
-    "Artifact",
     "Runegraft",
     "AllflameEmber",
+    "Tattoo",
+    "Omen",
     "DjinnCoin",
     "Ducat",
     "EnshroudingCrystal",
+    "DivinationCard",
+    "Artifact",
+    "Oil",
+    "DeliriumOrb",
+    "Scarab",
+    "Astrolabe",
+    "Fossil",
+    "Resonator",
+    "Essence",
 ];
 
 /// What a normal refresh fetches: everything a dropped item is likely to be,
@@ -79,7 +87,6 @@ pub const DEFAULT_ITEM_TYPES: &[&str] = &[
     "UniqueJewel",
     "UniqueRelic",
     "UniqueTincture",
-    "ClusterJewel",
     "UniqueMap",
     "BlightedMap",
     "BlightRavagedMap",
@@ -90,7 +97,7 @@ pub fn all_item_types() -> Vec<&'static str> {
     POE1_ITEM_TYPES.to_vec()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PriceLine {
     pub league: String,
     pub category: String,
@@ -107,6 +114,12 @@ pub struct PriceLine {
     pub listing_count: Option<i64>,
     pub details_id: Option<String>,
     pub fetched_at: i64,
+    /// poe.ninja's item class: 3 unique, 9 relic, 10 foil.
+    pub item_class: Option<i64>,
+    pub level_required: Option<i64>,
+    /// Trade-site id of an exchange item (`divine`, `mirror-shard`): the short
+    /// form people type in price notes.
+    pub trade_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,21 +188,28 @@ impl NinjaClient {
             urlencode(league),
             urlencode(category)
         );
-        self.overview(league, &path, category, etag, parse_item_lines)
+        self.overview(
+            league,
+            &path,
+            category,
+            etag,
+            |league, category, body, at| Ok(parse_item_lines(league, category, body, at)),
+        )
     }
 
-    pub fn currency_overview(
+    /// Bulk-traded items (currency, fragments, scarabs, cards, …).
+    pub fn exchange_overview(
         &self,
         league: &str,
         category: &str,
         etag: Option<&str>,
     ) -> Result<Overview> {
         let path = format!(
-            "/poe1/api/economy/stash/current/currency/overview?league={}&type={}",
+            "/poe1/api/economy/exchange/current/overview?league={}&type={}",
             urlencode(league),
             urlencode(category)
         );
-        self.overview(league, &path, category, etag, parse_currency_lines)
+        self.overview(league, &path, category, etag, parse_exchange_lines)
     }
 
     fn overview(
@@ -198,7 +218,7 @@ impl NinjaClient {
         path: &str,
         category: &str,
         etag: Option<&str>,
-        parse: fn(&str, &str, &Value, i64) -> Vec<PriceLine>,
+        parse: fn(&str, &str, &Value, i64) -> Result<Vec<PriceLine>>,
     ) -> Result<Overview> {
         let (status, body, new_etag) = self.get(path, etag)?;
         match status {
@@ -208,7 +228,7 @@ impl NinjaClient {
                     serde_json::from_str(&body).context("parsing poe.ninja overview")?;
                 let fetched_at = crate::store::unix_now();
                 Ok(Overview::Lines {
-                    lines: parse(league, category, &value, fetched_at),
+                    lines: parse(league, category, &value, fetched_at)?,
                     etag: new_etag,
                 })
             }
@@ -278,6 +298,9 @@ pub fn parse_item_lines(league: &str, category: &str, body: &Value, at: i64) -> 
                         listing_count: line_int(line, "listingCount"),
                         details_id: line_str(line, "detailsId"),
                         fetched_at: at,
+                        item_class: line_int(line, "itemClass"),
+                        level_required: line_int(line, "levelRequired"),
+                        trade_id: None,
                     })
                 })
                 .collect()
@@ -285,47 +308,91 @@ pub fn parse_item_lines(league: &str, category: &str, body: &Value, at: i64) -> 
         .unwrap_or_default()
 }
 
-pub fn parse_currency_lines(league: &str, category: &str, body: &Value, at: i64) -> Vec<PriceLine> {
-    body.get("lines")
+/// Exchange overview: `lines` carry an id and a value in `core.primary`
+/// currency; names come from the `items` lists.
+pub fn parse_exchange_lines(
+    league: &str,
+    category: &str,
+    body: &Value,
+    at: i64,
+) -> Result<Vec<PriceLine>> {
+    let core = body.get("core");
+    let primary = core.and_then(|c| c.get("primary")).and_then(Value::as_str);
+    if primary != Some("chaos") {
+        bail!(
+            "poe.ninja exchange {category}: prices are quoted in {:?}, expected chaos",
+            primary.unwrap_or("nothing")
+        );
+    }
+    let divine_per_chaos = core
+        .and_then(|c| c.get("rates"))
+        .and_then(|r| r.get("divine"))
+        .and_then(Value::as_f64);
+
+    let mut names: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for list in [body.get("items"), core.and_then(|c| c.get("items"))] {
+        for item in list.and_then(Value::as_array).into_iter().flatten() {
+            if let (Some(id), Some(name)) = (line_str(item, "id"), line_str(item, "name")) {
+                names
+                    .entry(id)
+                    .or_insert_with(|| (name, line_str(item, "detailsId")));
+            }
+        }
+    }
+
+    Ok(body
+        .get("lines")
         .and_then(Value::as_array)
-        .map(|lines| {
-            lines
-                .iter()
-                .filter_map(|line| {
-                    let chaos = line_value(line, "chaosEquivalent")?;
-                    Some(PriceLine {
-                        league: league.to_owned(),
-                        category: category.to_owned(),
-                        name: line_str(line, "currencyTypeName"),
-                        base_type: None,
-                        variant: None,
-                        links: None,
-                        corrupted: None,
-                        gem_level: None,
-                        gem_quality: None,
-                        map_tier: None,
-                        chaos,
-                        divine: line_value(line, "divineEquivalent"),
-                        listing_count: line_int(line, "listingCount"),
-                        details_id: line_str(line, "detailsId"),
-                        fetched_at: at,
-                    })
-                })
-                .collect()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            let id = line_str(line, "id")?;
+            let (name, details_id) = names.get(&id)?;
+            let chaos = line_value(line, "primaryValue")?;
+            Some(PriceLine {
+                league: league.to_owned(),
+                category: category.to_owned(),
+                name: Some(name.clone()),
+                chaos,
+                divine: divine_per_chaos.map(|rate| chaos * rate),
+                listing_count: None,
+                details_id: details_id.clone(),
+                fetched_at: at,
+                trade_id: Some(id),
+                ..Default::default()
+            })
         })
-        .unwrap_or_default()
+        .collect())
 }
+
+/// Unique, relic and foil frame types / item classes. A foil and a plain
+/// unique share a name but not a price.
+const UNIQUE_CLASSES: [i64; 3] = [3, 9, 10];
 
 /// Pick the best matching overview line for an item.
 ///
-/// Name is the hard filter (unique name, currency name, gem name, base type);
-/// ties are broken by the fields that actually move the price: corruption,
-/// links, gem level/quality, map tier, base type.
+/// Name is the hard filter (unique name, currency name, gem name); ties are
+/// broken by the fields that actually move the price: corruption, links, gem
+/// level/quality, map tier, base type. Base-type and cluster-jewel lines are
+/// stored but never matched: a rare's value is its mods, not its base.
 pub fn lookup<'a>(lines: &'a [PriceLine], item: &ItemView) -> Option<&'a PriceLine> {
     let name = item.name.as_deref().unwrap_or("");
     let type_line = item.type_line.as_deref().unwrap_or("");
     let base = item.base_type.as_deref().unwrap_or(type_line);
 
+    let usable = |l: &PriceLine| -> bool {
+        if l.category == "BaseType" || l.category == "ClusterJewel" {
+            return false;
+        }
+        match (item.frame_type, l.item_class) {
+            (Some(frame), Some(class))
+                if UNIQUE_CLASSES.contains(&frame) && UNIQUE_CLASSES.contains(&class) =>
+            {
+                frame == class
+            }
+            _ => true,
+        }
+    };
     let candidates = |key: &str| -> Vec<&PriceLine> {
         if key.is_empty() {
             return Vec::new();
@@ -337,6 +404,7 @@ pub fn lookup<'a>(lines: &'a [PriceLine], item: &ItemView) -> Option<&'a PriceLi
                     .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(key))
             })
+            .filter(|l| usable(l))
             .collect()
     };
 
@@ -359,9 +427,9 @@ pub fn lookup<'a>(lines: &'a [PriceLine], item: &ItemView) -> Option<&'a PriceLi
             // cannot be told apart from the item JSON, so prefer the most
             // widely listed variant, then the cheaper one.
             .then_with(|| {
-                b.listing_count
+                a.listing_count
                     .unwrap_or(0)
-                    .cmp(&a.listing_count.unwrap_or(0))
+                    .cmp(&b.listing_count.unwrap_or(0))
             })
             .then_with(|| {
                 b.chaos
@@ -455,19 +523,95 @@ mod tests {
     }
 
     #[test]
-    fn currency_lines_parse_by_name() {
+    fn equal_lines_prefer_the_most_listed() {
         let body = json!({"lines": [
-            {"currencyTypeName": "Mirror of Kalandra", "chaosEquivalent": 950480,
-             "divineEquivalent": 1420.0, "detailsId": "mirror-of-kalandra"}
+            {"name": "Voices", "baseType": "Large Cluster Jewel", "chaosValue": 1.0,
+             "listingCount": 5494},
+            {"name": "Voices", "baseType": "Large Cluster Jewel", "chaosValue": 41818.0,
+             "listingCount": 74}
         ]});
-        let parsed = parse_currency_lines("Standard", "Currency", &body, 100);
-        assert_eq!(parsed.len(), 1);
+        let lines = parse_item_lines("Standard", "UniqueJewel", &body, 100);
         let item = ItemView {
-            type_line: Some("Mirror of Kalandra".into()),
+            name: Some("Voices".into()),
+            type_line: Some("Large Cluster Jewel".into()),
+            base_type: Some("Large Cluster Jewel".into()),
+            frame_type: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(lookup(&lines, &item).unwrap().chaos, 1.0);
+    }
+
+    #[test]
+    fn foil_lines_do_not_price_plain_uniques() {
+        let body = json!({"lines": [
+            {"name": "Headhunter", "baseType": "Leather Belt", "chaosValue": 90000.0,
+             "itemClass": 10, "listingCount": 2}
+        ]});
+        let lines = parse_item_lines("Standard", "UniqueAccessory", &body, 100);
+        let item = ItemView {
+            name: Some("Headhunter".into()),
+            type_line: Some("Leather Belt".into()),
+            base_type: Some("Leather Belt".into()),
+            frame_type: Some(3),
+            ..Default::default()
+        };
+        assert!(lookup(&lines, &item).is_none());
+    }
+
+    #[test]
+    fn rares_are_not_priced_by_their_base() {
+        let body = json!({"lines": [
+            {"name": "Stygian Vise", "baseType": "Stygian Vise", "chaosValue": 80.0,
+             "listingCount": 500}
+        ]});
+        let lines = parse_item_lines("Standard", "BaseType", &body, 100);
+        let item = ItemView {
+            name: Some("Doom Snare".into()),
+            type_line: Some("Stygian Vise".into()),
+            base_type: Some("Stygian Vise".into()),
+            frame_type: Some(2),
+            ..Default::default()
+        };
+        assert!(lookup(&lines, &item).is_none());
+    }
+
+    #[test]
+    fn exchange_lines_parse_with_names_and_trade_ids() {
+        let body = json!({
+            "core": {
+                "primary": "chaos",
+                "secondary": "divine",
+                "rates": {"divine": 0.0025},
+                "items": [{"id": "divine", "name": "Divine Orb", "detailsId": "divine-orb"}]
+            },
+            "items": [],
+            "lines": [
+                {"id": "divine", "primaryValue": 400},
+                {"id": "unnamed", "primaryValue": 3}
+            ]
+        });
+        let parsed = parse_exchange_lines("Standard", "Currency", &body, 100).unwrap();
+        assert_eq!(parsed.len(), 1, "lines without a name are skipped");
+        let line = &parsed[0];
+        assert_eq!(line.chaos, 400.0);
+        assert!((line.divine.unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(line.trade_id.as_deref(), Some("divine"));
+        assert_eq!(line.details_id.as_deref(), Some("divine-orb"));
+        let item = ItemView {
+            type_line: Some("Divine Orb".into()),
             frame_type: Some(5),
             ..Default::default()
         };
-        assert_eq!(lookup(&parsed, &item).unwrap().chaos, 950480.0);
+        assert_eq!(lookup(&parsed, &item).unwrap().chaos, 400.0);
+    }
+
+    #[test]
+    fn exchange_prices_must_be_in_chaos() {
+        let body = json!({"core": {"primary": "divine", "items": []}, "lines": []});
+        let err = parse_exchange_lines("Standard", "Currency", &body, 100)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected chaos"), "{err}");
     }
 
     #[test]

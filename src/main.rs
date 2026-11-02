@@ -228,7 +228,7 @@ enum NinjaCommand {
         /// Every category, including gems and base types
         #[arg(long)]
         all: bool,
-        /// Skip the currency-overview categories
+        /// Skip the exchange categories (currency, fragments, scarabs, cards, …)
         #[arg(long)]
         no_currency: bool,
         #[arg(long)]
@@ -874,7 +874,19 @@ fn show_stats(cfg: &Config, json: bool) -> Result<()> {
 }
 
 fn contact(cfg: &Config) -> String {
-    cfg.contact.clone().unwrap_or_else(|| "unset".to_string())
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match cfg.contact.clone().filter(|c| !c.is_empty()) {
+        Some(contact) => contact,
+        None => {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "no contact configured: poe.ninja and GGG ask for one in the User-Agent; \
+                     set BIG_OIL_CONTACT"
+                );
+            }
+            "unset".to_string()
+        }
+    }
 }
 
 fn value_cell(row: &store::ItemRow) -> String {
@@ -926,33 +938,56 @@ fn fetch_prices(
 
     for category in item_types {
         let etag = store.price_etag(league, category)?;
-        match client.item_overview(league, category, etag.as_deref())? {
-            Overview::NotModified => tracing::debug!(category, "unchanged"),
-            Overview::Lines { lines, etag } => {
-                let n = store.upsert_price_lines(league, category, etag.as_deref(), &lines)?;
-                stored += n;
-                categories += 1;
-                tracing::debug!(category, lines = n, "stored");
-            }
+        let overview = client.item_overview(league, category, etag.as_deref())?;
+        if let Some(n) = store_overview(store, league, category, overview)? {
+            stored += n;
+            categories += 1;
         }
     }
 
     if include_currency {
-        for category in ninja::POE1_CURRENCY_TYPES {
+        for category in ninja::POE1_EXCHANGE_TYPES {
             let etag = store.price_etag(league, category)?;
-            match client.currency_overview(league, category, etag.as_deref())? {
-                Overview::NotModified => {}
-                Overview::Lines { lines, etag } => {
-                    let n = store.upsert_price_lines(league, category, etag.as_deref(), &lines)?;
-                    stored += n;
-                    categories += 1;
-                    tracing::debug!(category, lines = n, "stored");
+            // One odd category (e.g. quoted in another currency) must not
+            // cost the rest of the snapshot.
+            let overview = match client.exchange_overview(league, category, etag.as_deref()) {
+                Ok(overview) => overview,
+                Err(e) => {
+                    tracing::warn!(category, error = %e, "poe.ninja category skipped");
+                    continue;
                 }
+            };
+            if let Some(n) = store_overview(store, league, category, overview)? {
+                stored += n;
+                categories += 1;
             }
         }
     }
 
     Ok((stored, categories))
+}
+
+/// Store one overview; `None` when poe.ninja said it is unchanged.
+fn store_overview(
+    store: &mut Store,
+    league: &str,
+    category: &str,
+    overview: Overview,
+) -> Result<Option<usize>> {
+    match overview {
+        Overview::NotModified => {
+            tracing::debug!(category, "unchanged");
+            Ok(None)
+        }
+        Overview::Lines { lines, etag } => {
+            if lines.is_empty() {
+                tracing::warn!(category, "poe.ninja returned no lines");
+            }
+            let n = store.upsert_price_lines(league, category, etag.as_deref(), &lines)?;
+            tracing::debug!(category, lines = n, "stored");
+            Ok(Some(n))
+        }
+    }
 }
 
 fn ninja_fetch_cmd(

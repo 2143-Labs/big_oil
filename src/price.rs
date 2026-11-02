@@ -31,8 +31,8 @@ pub fn same_price(a: Option<&Price>, b: Option<&Price>) -> bool {
     }
 }
 
-/// Parse a price note. Returns `None` for free text, "sold", bulk-only notes,
-/// and anything else that is not a single amount + currency.
+/// Parse a price note. Returns `None` for free text, "sold", and anything else
+/// that is not an amount + currency.
 pub fn parse_note(note: &str) -> Option<Price> {
     let note = note.trim();
     let note = note.strip_prefix('~').unwrap_or(note).trim_start();
@@ -47,23 +47,48 @@ pub fn parse_note(note: &str) -> Option<Price> {
         _ => return None,
     };
 
-    let amount = parts.next()?.replace(',', "");
-    // "1/2 divine" and friends are not a single price.
-    if amount.contains('/') {
-        return None;
-    }
-    let amount: f64 = amount.parse().ok()?;
-    if !amount.is_finite() || amount <= 0.0 {
-        return None;
-    }
+    let amount = parse_amount(parts.next()?)?;
 
-    let currency = parts.next()?.to_ascii_lowercase();
+    // "3 mirror shard" is the shard, not the mirror.
+    let first = parts.next()?.to_ascii_lowercase();
+    let currency = match parts.next().map(str::to_ascii_lowercase).as_deref() {
+        Some("shard" | "shards") => format!("{first}-shard"),
+        _ => first,
+    };
     // A note that keeps talking ("~b/o 1 divine for both") is still usable: the
     // amount and currency are unambiguous, the rest is commentary.
     Some(Price {
         kind: kind.to_owned(),
         amount,
         currency,
+    })
+}
+
+/// `12`, `1.5`, `1,5` (decimal comma), `1,000` (thousands), or `a/b`: a stack
+/// price for `b` units, so the note prices one unit at `a / b`.
+fn parse_amount(token: &str) -> Option<f64> {
+    let value = if let Some((a, b)) = token.split_once('/') {
+        let a: f64 = a.parse().ok()?;
+        let b: f64 = b.parse().ok()?;
+        if !(a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0) {
+            return None;
+        }
+        a / b
+    } else if is_decimal_comma(token) {
+        token.replace(',', ".").parse().ok()?
+    } else {
+        token.replace(',', "").parse().ok()?
+    };
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// Exactly one comma, no dot, and one or two digits after it.
+fn is_decimal_comma(token: &str) -> bool {
+    if token.contains('.') || token.matches(',').count() != 1 {
+        return false;
+    }
+    token.split_once(',').is_some_and(|(_, frac)| {
+        (1..=2).contains(&frac.len()) && frac.chars().all(|c| c.is_ascii_digit())
     })
 }
 
@@ -89,6 +114,16 @@ mod tests {
         );
         assert_eq!(parse_note("~gb/o 1.5 mirror").unwrap().amount, 1.5);
         assert_eq!(parse_note("~b/o 1,000 chaos").unwrap().amount, 1000.0);
+        assert_eq!(parse_note("~b/o 1,5 divine").unwrap().amount, 1.5);
+        assert_eq!(parse_note("~b/o 1/2 divine").unwrap().amount, 0.5);
+        assert_eq!(parse_note("~price 1/10 chaos").unwrap().amount, 0.1);
+        let shard = parse_note("~b/o 3 mirror shard").unwrap();
+        assert_eq!(
+            (shard.amount, shard.currency.as_str()),
+            (3.0, "mirror-shard")
+        );
+        let both = parse_note("~price 1 divine for both").unwrap();
+        assert_eq!((both.amount, both.currency.as_str()), (1.0, "divine"));
     }
 
     #[test]
@@ -96,7 +131,6 @@ mod tests {
         for note in [
             "",
             "sold",
-            "~b/o 1/2 divine",
             "~b/o amount",
             "10 chaos",
             "~b/o 0 chaos",

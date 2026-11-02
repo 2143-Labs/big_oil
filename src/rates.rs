@@ -1,9 +1,9 @@
 //! Currency conversion for price notes.
 //!
 //! Notes are hand-typed (`~b/o 3 divine`, `~b/o 40 alch`), while poe.ninja
-//! values are chaos. The currency overview gives a chaos value per currency
-//! name, so the job here is mapping the short forms people type onto those
-//! names.
+//! values are chaos. The exchange overview gives a chaos value per currency,
+//! keyed here by its full name and by its trade-site id (`divine`,
+//! `mirror-shard`), which is what most notes use; aliases cover the rest.
 
 use std::collections::HashMap;
 
@@ -21,13 +21,18 @@ const ALIASES: &[(&str, &str)] = &[
     ("augment", "Orb of Augmentation"),
     ("blessed", "Blessed Orb"),
     ("chance", "Orb of Chance"),
+    ("c", "Chaos Orb"),
     ("chaos", "Chaos Orb"),
     ("chrom", "Chromatic Orb"),
     ("chrome", "Chromatic Orb"),
+    ("div", "Divine Orb"),
     ("divine", "Divine Orb"),
+    ("divines", "Divine Orb"),
     ("ex", "Exalted Orb"),
+    ("exa", "Exalted Orb"),
     ("exalt", "Exalted Orb"),
     ("exalted", "Exalted Orb"),
+    ("exalts", "Exalted Orb"),
     ("fuse", "Orb of Fusing"),
     ("fusing", "Orb of Fusing"),
     ("gcp", "Gemcutter's Prism"),
@@ -60,20 +65,25 @@ pub struct Rates {
 }
 
 impl Rates {
-    /// Build from stored economy lines; only the currency overview is relevant.
+    /// Build from stored economy lines; only the Currency category is used.
     pub fn from_lines(lines: &[PriceLine]) -> Rates {
         let mut chaos_per = HashMap::new();
         for line in lines
             .iter()
             .filter(|l| l.category.eq_ignore_ascii_case("currency"))
         {
-            let Some(name) = &line.name else { continue };
-            let key = normalise(name);
-            if key.is_empty() || !line.chaos.is_finite() || line.chaos <= 0.0 {
+            if !line.chaos.is_finite() || line.chaos <= 0.0 {
                 continue;
             }
-            // A currency can appear more than once; keep the first sane value.
-            chaos_per.entry(key).or_insert(line.chaos);
+            for key in [&line.name, &line.trade_id]
+                .into_iter()
+                .flatten()
+                .map(|k| normalise(k))
+                .filter(|k| !k.is_empty())
+            {
+                // A currency can appear more than once; keep the first sane value.
+                chaos_per.entry(key).or_insert(line.chaos);
+            }
         }
         Rates {
             entries: chaos_per.len(),
@@ -90,32 +100,14 @@ impl Rates {
         if key == "chaos" {
             return Some(1.0);
         }
-        // Alias first, then direct, then substring (handles "Orb of X").
-        let targets: Vec<String> = ALIASES
+        // Alias first, then the name or trade id as typed. No substring
+        // guessing: "shard" must not quietly become a Mirror Shard.
+        ALIASES
             .iter()
             .filter(|(short, _)| *short == key)
             .map(|(_, full)| normalise(full))
             .chain(std::iter::once(key.clone()))
-            .collect();
-
-        for target in &targets {
-            if let Some(value) = self.chaos_per.get(target) {
-                return Some(*value);
-            }
-        }
-        for target in &targets {
-            if target.len() < 4 {
-                continue;
-            }
-            let mut hits = self
-                .chaos_per
-                .iter()
-                .filter(|(name, _)| name.contains(target.as_str()));
-            if let (Some((_, value)), None) = (hits.next(), hits.next()) {
-                return Some(*value);
-            }
-        }
-        None
+            .find_map(|target| self.chaos_per.get(&target).copied())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -132,18 +124,8 @@ mod tests {
             league: "Standard".into(),
             category: "Currency".into(),
             name: Some(name.into()),
-            base_type: None,
-            variant: None,
-            links: None,
-            corrupted: None,
-            gem_level: None,
-            gem_quality: None,
-            map_tier: None,
             chaos,
-            divine: None,
-            listing_count: None,
-            details_id: None,
-            fetched_at: 0,
+            ..Default::default()
         }
     }
 
@@ -154,6 +136,10 @@ mod tests {
             line("Orb of Alchemy", 0.2),
             line("Mirror of Kalandra", 950_000.0),
             line("Exalted Orb", 12.0),
+            PriceLine {
+                trade_id: Some("mirror-shard".into()),
+                ..line("Mirror Shard", 47_000.0)
+            },
         ])
     }
 
@@ -172,6 +158,12 @@ mod tests {
         assert_eq!(r.chaos_per_unit("exalted"), Some(12.0));
         // Case and punctuation are irrelevant.
         assert_eq!(r.chaos_per_unit("Divine"), Some(420.0));
+        assert_eq!(r.chaos_per_unit("div"), Some(420.0));
+    }
+
+    #[test]
+    fn resolves_trade_ids() {
+        assert_eq!(rates().chaos_per_unit("mirror-shard"), Some(47_000.0));
     }
 
     #[test]
@@ -183,7 +175,8 @@ mod tests {
 
     #[test]
     fn ambiguous_substrings_do_not_match() {
-        // "orb" alone would match several currencies.
+        // "orb" alone would match several currencies, "shard" a Mirror Shard.
         assert_eq!(rates().chaos_per_unit("orb"), None);
+        assert_eq!(rates().chaos_per_unit("shard"), None);
     }
 }

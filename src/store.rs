@@ -740,8 +740,9 @@ impl Store {
             let mut stmt = tx.prepare(
                 "INSERT INTO price_ref(league, category, name, base_type, variant, links,
                     corrupted, gem_level, gem_quality, map_tier, chaos, divine, listing_count,
-                    details_id, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    details_id, fetched_at, item_class, level_required, trade_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18)",
             )?;
             for line in lines {
                 stmt.execute(params![
@@ -760,6 +761,9 @@ impl Store {
                     line.listing_count,
                     line.details_id,
                     line.fetched_at,
+                    line.item_class,
+                    line.level_required,
+                    line.trade_id,
                 ])?;
             }
         }
@@ -775,7 +779,8 @@ impl Store {
     pub fn price_lines(&self, league: &str) -> Result<Vec<PriceLine>> {
         let mut stmt = self.conn.prepare(
             "SELECT league, category, name, base_type, variant, links, corrupted, gem_level,
-                    gem_quality, map_tier, chaos, divine, listing_count, details_id, fetched_at
+                    gem_quality, map_tier, chaos, divine, listing_count, details_id, fetched_at,
+                    item_class, level_required, trade_id
              FROM price_ref WHERE league = ?1",
         )?;
         let rows = stmt
@@ -796,6 +801,9 @@ impl Store {
                     listing_count: r.get(12)?,
                     details_id: r.get(13)?,
                     fetched_at: r.get(14)?,
+                    item_class: r.get(15)?,
+                    level_required: r.get(16)?,
+                    trade_id: r.get(17)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

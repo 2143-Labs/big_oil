@@ -311,6 +311,7 @@ mod tests {
             listing_count: None,
             details_id: None,
             fetched_at: 0,
+            ..Default::default()
         }])
     }
 
