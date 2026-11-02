@@ -12,6 +12,25 @@ pub struct Price {
     pub currency: String,
 }
 
+impl Price {
+    /// Same amount, currency and kind. Kind counts: `~b/o` → `~price` is a
+    /// change a buyer sees.
+    pub fn same_as(&self, other: &Price) -> bool {
+        (self.amount - other.amount).abs() < 1e-9
+            && self.currency.eq_ignore_ascii_case(&other.currency)
+            && self.kind == other.kind
+    }
+}
+
+/// Equality over optional prices: two missing prices are the same.
+pub fn same_price(a: Option<&Price>, b: Option<&Price>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same_as(b),
+        _ => false,
+    }
+}
+
 /// Parse a price note. Returns `None` for free text, "sold", bulk-only notes,
 /// and anything else that is not a single amount + currency.
 pub fn parse_note(note: &str) -> Option<Price> {

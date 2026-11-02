@@ -94,6 +94,22 @@ fn indexes_mods_from_structured_and_plain_fields() {
 }
 
 #[test]
+fn mods_search_ignores_item_names() {
+    let mut store = store();
+    store.ingest_page(&parse(&fixture()), true).unwrap();
+    let rows = store
+        .search(&SearchQuery {
+            mods: Some("Headhunter".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    // The Doctor's mod line names Headhunter (`<uniqueitem>{Headhunter}`); the
+    // belt called Headhunter has no such mod and must not match.
+    let names: Vec<String> = rows.iter().map(|r| r.display_name()).collect();
+    assert_eq!(names, vec!["The Doctor"], "--mods searches mod text only");
+}
+
+#[test]
 fn detects_price_changes_without_creating_a_new_item() {
     let mut store = store();
     let mut page = fixture();

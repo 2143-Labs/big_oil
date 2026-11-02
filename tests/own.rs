@@ -5,9 +5,20 @@ mod support;
 use big_oil::model::Item;
 use big_oil::ninja::PriceLine;
 use big_oil::own::OwnClient;
-use big_oil::store::{SearchQuery, Store, unix_now};
+use big_oil::store::{OwnTab, SearchQuery, Store, unix_now};
 use serde_json::json;
 use support::{mock, response};
+
+fn tab<'a>(id: &'a str, name: &'a str) -> OwnTab<'a> {
+    OwnTab {
+        stash_id: id,
+        index: 0,
+        name,
+        stash_type: "PremiumStash",
+        league: "Standard",
+        account: Some("Tester#1"),
+    }
+}
 
 fn item(value: serde_json::Value) -> Item {
     Item::from_value(&value)
@@ -51,14 +62,7 @@ fn line(name: &str, base: Option<&str>, chaos: f64) -> PriceLine {
 fn own_tab_diff_records_drops_and_removals() {
     let mut store = Store::open_memory().unwrap();
     let stats = store
-        .ingest_own_tab(
-            "stash-1",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[headhunter(), chaos_orb()],
-        )
+        .ingest_own_tab(&tab("stash-1", "Dump"), &[headhunter(), chaos_orb()])
         .unwrap();
     assert_eq!(stats.items_new, 2);
 
@@ -72,27 +76,13 @@ fn own_tab_diff_records_drops_and_removals() {
 
     // Move the belt away, drop something else in.
     let stats = store
-        .ingest_own_tab(
-            "stash-1",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[chaos_orb(), headhunter()],
-        )
+        .ingest_own_tab(&tab("stash-1", "Dump"), &[chaos_orb(), headhunter()])
         .unwrap();
     assert_eq!(stats.items_new, 0, "same items are not re-listed");
     assert_eq!(stats.delisted, 0);
 
     let stats = store
-        .ingest_own_tab(
-            "stash-1",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[chaos_orb()],
-        )
+        .ingest_own_tab(&tab("stash-1", "Dump"), &[chaos_orb()])
         .unwrap();
     assert_eq!(stats.delisted, 1);
     assert_eq!(
@@ -102,7 +92,6 @@ fn own_tab_diff_records_drops_and_removals() {
 
     let live = store
         .search(&SearchQuery {
-            source: Some("own".into()),
             ..Default::default()
         })
         .unwrap();
@@ -112,7 +101,6 @@ fn own_tab_diff_records_drops_and_removals() {
 
     let all = store
         .search(&SearchQuery {
-            source: Some("own".into()),
             include_delisted: true,
             ..Default::default()
         })
@@ -124,14 +112,7 @@ fn own_tab_diff_records_drops_and_removals() {
 fn values_own_items_from_price_lines() {
     let mut store = Store::open_memory().unwrap();
     store
-        .ingest_own_tab(
-            "stash-1",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[headhunter(), chaos_orb()],
-        )
+        .ingest_own_tab(&tab("stash-1", "Dump"), &[headhunter(), chaos_orb()])
         .unwrap();
 
     let lines = vec![
@@ -154,23 +135,16 @@ fn values_own_items_from_price_lines() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].chaos, Some(6675.0));
 
-    // A second pass appends history rather than replacing it.
+    // An unchanged value is not recorded again.
     store.value_items("Standard").unwrap();
-    assert_eq!(store.valuations("h1").unwrap().len(), 2);
+    assert_eq!(store.valuations("h1").unwrap().len(), 1);
 }
 
 #[test]
 fn tabs_summary_totals_live_values() {
     let mut store = Store::open_memory().unwrap();
     store
-        .ingest_own_tab(
-            "stash-1",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[headhunter(), chaos_orb()],
-        )
+        .ingest_own_tab(&tab("stash-1", "Dump"), &[headhunter(), chaos_orb()])
         .unwrap();
     store
         .upsert_price_lines(
@@ -190,7 +164,52 @@ fn tabs_summary_totals_live_values() {
     assert_eq!(tabs[0].name, "Dump");
     assert_eq!(tabs[0].items, 2);
     assert_eq!(tabs[0].live, 2);
-    assert_eq!(tabs[0].value_chaos, 6676.0);
+    // Value counts the whole stack: 6675 + 312 × 1.
+    assert_eq!(tabs[0].value_chaos, 6987.0);
+}
+
+#[test]
+fn tab_name_price_applies_to_items_without_notes() {
+    let mut store = Store::open_memory().unwrap();
+    let mut noted = chaos_orb();
+    noted.note = Some("~b/o 50 chaos".into());
+    store
+        .ingest_own_tab(
+            &tab("stash-1", "~price 1 divine"),
+            &[headhunter(), noted.clone()],
+        )
+        .unwrap();
+
+    let belt = store.item("h1").unwrap().unwrap();
+    assert_eq!(belt.price_amount, Some(1.0));
+    assert_eq!(belt.price_currency.as_deref(), Some("divine"));
+    assert!(belt.price_from_tab);
+    let orb = store.item("c1").unwrap().unwrap();
+    assert_eq!(orb.price_amount, Some(50.0));
+    assert_eq!(orb.price_currency.as_deref(), Some("chaos"));
+    assert!(!orb.price_from_tab, "the item's own note wins");
+    let orb_events = store.history("c1").unwrap().len();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    store
+        .ingest_own_tab(&tab("stash-1", "~price 0.8 divine"), &[headhunter(), noted])
+        .unwrap();
+
+    let history = store.history("h1").unwrap();
+    let last = history.last().unwrap();
+    assert_eq!(last.event, "price_changed");
+    assert_eq!(last.price_amount, Some(0.8));
+    assert_eq!(last.old_amount, Some(1.0));
+    let repriced = store.item("h1").unwrap().unwrap();
+    assert!(repriced.price_since > belt.price_since);
+
+    assert_eq!(
+        store.history("c1").unwrap().len(),
+        orb_events,
+        "a noted item ignores the tab rename"
+    );
+    let orb_after = store.item("c1").unwrap().unwrap();
+    assert!(orb_after.tab_price_since > orb.tab_price_since);
 }
 
 #[test]
@@ -222,14 +241,7 @@ fn opens_a_v1_database_and_migrates_it() {
 
     let mut store = Store::open(&path).unwrap();
     let stats = store
-        .ingest_own_tab(
-            "stash-1",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[headhunter()],
-        )
+        .ingest_own_tab(&tab("stash-1", "Dump"), &[headhunter()])
         .unwrap();
     assert_eq!(stats.items_new, 1);
     let row = store.item("h1").unwrap().unwrap();
@@ -285,14 +297,7 @@ fn client_sends_session_cookie_and_tab_params() {
 fn decay_clock_follows_price_changes_not_moves() {
     let mut store = Store::open_memory().unwrap();
     store
-        .ingest_own_tab(
-            "tab-a",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[headhunter()],
-        )
+        .ingest_own_tab(&tab("tab-a", "Dump"), &[headhunter()])
         .unwrap();
     let first = store.item("h1").unwrap().unwrap().price_since.unwrap();
 
@@ -300,25 +305,9 @@ fn decay_clock_follows_price_changes_not_moves() {
 
     // Move the belt to another tab: it leaves one snapshot and appears in the
     // next, but that is not a price change.
+    store.ingest_own_tab(&tab("tab-a", "Dump"), &[]).unwrap();
     store
-        .ingest_own_tab(
-            "tab-a",
-            "Dump",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[],
-        )
-        .unwrap();
-    store
-        .ingest_own_tab(
-            "tab-b",
-            "Sale",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[headhunter()],
-        )
+        .ingest_own_tab(&tab("tab-b", "Sale"), &[headhunter()])
         .unwrap();
     let moved = store.item("h1").unwrap().unwrap().price_since.unwrap();
     assert_eq!(moved, first, "moving tabs must not restart the decay clock");
@@ -328,14 +317,7 @@ fn decay_clock_follows_price_changes_not_moves() {
     let mut priced = headhunter();
     priced.note = Some("~b/o 50 chaos".into());
     store
-        .ingest_own_tab(
-            "tab-b",
-            "Sale",
-            "PremiumStash",
-            "Standard",
-            Some("Tester#1"),
-            &[priced],
-        )
+        .ingest_own_tab(&tab("tab-b", "Sale"), &[priced])
         .unwrap();
     let changed = store.item("h1").unwrap().unwrap().price_since.unwrap();
     assert!(changed > first, "a price change restarts the clock");

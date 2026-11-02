@@ -21,7 +21,7 @@ use big_oil::overlay::{self, Calibration};
 use big_oil::own::OwnClient;
 use big_oil::rates::Rates;
 use big_oil::render;
-use big_oil::store::{self, Order, SearchQuery, Store};
+use big_oil::store::{self, Order, OwnTab, SearchQuery, Store};
 
 #[derive(Parser)]
 #[command(
@@ -31,12 +31,46 @@ use big_oil::store::{self, Order, SearchQuery, Store};
     long_about = None
 )]
 struct Cli {
-    /// Database file (default: $XDG_DATA_HOME/big_oil/market.db)
+    /// Public stream database (default: $XDG_DATA_HOME/big_oil/market.db)
     #[arg(long, global = true, value_name = "PATH", env = "BIG_OIL_DB")]
     db: Option<PathBuf>,
 
+    /// Own-tab database (default: $XDG_DATA_HOME/big_oil/own.db)
+    #[arg(long, global = true, value_name = "PATH", env = "BIG_OIL_OWN_DB")]
+    own_db: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Which database a query reads.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Source {
+    /// The public stash stream (market.db)
+    Stream,
+    /// Your own tabs (own.db)
+    Own,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum OrderArg {
+    Newest,
+    Oldest,
+    PriceAsc,
+    PriceDesc,
+    IlvlDesc,
+}
+
+impl From<OrderArg> for Order {
+    fn from(order: OrderArg) -> Order {
+        match order {
+            OrderArg::Newest => Order::Newest,
+            OrderArg::Oldest => Order::Oldest,
+            OrderArg::PriceAsc => Order::PriceAsc,
+            OrderArg::PriceDesc => Order::PriceDesc,
+            OrderArg::IlvlDesc => Order::IlvlDesc,
+        }
+    }
 }
 
 // A parsed CLI is created once and immediately destructured; boxing variants
@@ -55,12 +89,18 @@ enum Command {
     /// Show one item and its listing history
     Item {
         id: String,
+        /// Database to look in (default: own tabs, then the stream)
+        #[arg(long, value_enum)]
+        source: Option<Source>,
         #[arg(long)]
         json: bool,
     },
     /// Print the listing history of one item
     History {
         id: String,
+        /// Database to look in (default: own tabs, then the stream)
+        #[arg(long, value_enum)]
+        source: Option<Source>,
         #[arg(long)]
         json: bool,
     },
@@ -298,9 +338,9 @@ struct Search {
     /// Only items first seen within this window (e.g. 30m, 6h, 7d)
     #[arg(long)]
     since: Option<String>,
-    /// Only own-stash items or only stream listings (stream|own)
-    #[arg(long)]
-    source: Option<String>,
+    /// Which database to search
+    #[arg(long, value_enum, default_value_t = Source::Stream)]
+    source: Source,
     /// Include sold/unlisted items
     #[arg(long)]
     include_delisted: bool,
@@ -308,9 +348,8 @@ struct Search {
     limit: usize,
     #[arg(long, default_value = "0")]
     offset: usize,
-    /// newest | oldest | price-asc | price-desc | ilvl-desc
-    #[arg(long, default_value = "newest")]
-    order: String,
+    #[arg(long, value_enum, default_value_t = OrderArg::Newest)]
+    order: OrderArg,
     #[arg(long)]
     json: bool,
 }
@@ -325,15 +364,15 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
-    let cfg = Config::load(cli.db)?;
+    let cfg = Config::load(cli.db, cli.own_db)?;
 
     match cli.command {
         Command::Watch(args) => watch(&cfg, args),
         Command::Ingest(args) => ingest(&cfg, args),
         Command::Auth(args) => run_auth(&cfg, args),
         Command::Search(args) => search(&cfg, args),
-        Command::Item { id, json } => show_item(&cfg, &id, json),
-        Command::History { id, json } => show_history(&cfg, &id, json),
+        Command::Item { id, source, json } => show_item(&cfg, &id, source, json),
+        Command::History { id, source, json } => show_history(&cfg, &id, source, json),
         Command::Stats { json } => show_stats(&cfg, json),
         Command::Stash { cmd } => match cmd {
             StashCommand::Watch(args) => stash_watch(&cfg, args),
@@ -370,8 +409,47 @@ fn init_tracing() {
         .try_init();
 }
 
-fn open_store(cfg: &Config) -> Result<Store> {
+/// The public stream database.
+fn open_market(cfg: &Config) -> Result<Store> {
     Store::open(&cfg.db_path)
+}
+
+/// Own tabs and the poe.ninja snapshot.
+fn open_own(cfg: &Config) -> Result<Store> {
+    Store::open(&cfg.own_db_path)
+}
+
+fn open_source(cfg: &Config, source: Source) -> Result<Store> {
+    match source {
+        Source::Stream => open_market(cfg),
+        Source::Own => open_own(cfg),
+    }
+}
+
+/// The database holding item `id`: the one `--source` names, otherwise own
+/// tabs first, then the stream.
+fn store_with_item(
+    cfg: &Config,
+    id: &str,
+    source: Option<Source>,
+) -> Result<(Store, store::ItemRow)> {
+    if let Some(source) = source {
+        let store = open_source(cfg, source)?;
+        return match store.item(id)? {
+            Some(item) => Ok((store, item)),
+            None => bail!("no item with id {id}"),
+        };
+    }
+    for path in [&cfg.own_db_path, &cfg.db_path] {
+        if !path.exists() {
+            continue;
+        }
+        let store = Store::open(path)?;
+        if let Some(item) = store.item(id)? {
+            return Ok((store, item));
+        }
+    }
+    bail!("no item with id {id} in either database")
 }
 
 fn load_token(cfg: &Config, force: bool) -> Result<auth::Token> {
@@ -400,7 +478,7 @@ fn make_client(cfg: &Config, token: &auth::Token, base_url: Option<String>) -> R
 }
 
 fn watch(cfg: &Config, args: Watch) -> Result<()> {
-    let mut store = open_store(cfg)?;
+    let mut store = open_market(cfg)?;
     let token = load_token(cfg, false)?;
     let mut client = make_client(cfg, &token, args.base_url.clone())?
         .with_min_interval(Duration::from_millis(args.min_interval_ms));
@@ -485,7 +563,7 @@ fn short(change_id: &str) -> String {
 }
 
 fn ingest(cfg: &Config, args: Ingest) -> Result<()> {
-    let mut store = open_store(cfg)?;
+    let mut store = open_market(cfg)?;
     let bytes = if args.file == "-" {
         let mut buf = Vec::new();
         std::io::stdin().read_to_end(&mut buf)?;
@@ -526,21 +604,13 @@ fn run_auth(cfg: &Config, args: Auth) -> Result<()> {
 }
 
 fn search(cfg: &Config, args: Search) -> Result<()> {
-    let store = open_store(cfg)?;
+    let store = open_source(cfg, args.source)?;
     let since = match &args.since {
         Some(raw) => Some(
             render::parse_since(raw)
                 .with_context(|| format!("--since {raw:?} is not a duration like 30m/6h/7d"))?,
         ),
         None => None,
-    };
-    let order = match args.order.as_str() {
-        "newest" => Order::Newest,
-        "oldest" => Order::Oldest,
-        "price-asc" => Order::PriceAsc,
-        "price-desc" => Order::PriceDesc,
-        "ilvl-desc" => Order::IlvlDesc,
-        other => bail!("unknown --order {other:?} (newest|oldest|price-asc|price-desc|ilvl-desc)"),
     };
     let query = SearchQuery {
         league: args.league,
@@ -556,11 +626,10 @@ fn search(cfg: &Config, args: Search) -> Result<()> {
         currency: args.currency,
         min_links: args.min_links,
         since,
-        source: args.source,
         include_delisted: args.include_delisted,
         limit: args.limit,
         offset: args.offset,
-        order,
+        order: args.order.into(),
     };
     let rows = store.search(&query)?;
     if args.json {
@@ -603,11 +672,8 @@ fn search(cfg: &Config, args: Search) -> Result<()> {
     Ok(())
 }
 
-fn show_item(cfg: &Config, id: &str, json: bool) -> Result<()> {
-    let store = open_store(cfg)?;
-    let Some(item) = store.item(id)? else {
-        bail!("no item with id {id}");
-    };
+fn show_item(cfg: &Config, id: &str, source: Option<Source>, json: bool) -> Result<()> {
+    let (store, item) = store_with_item(cfg, id, source)?;
     let history = store.history(id)?;
     let valuations = store.valuations(id)?;
     let (mods_text, raw) = store.item_extra(id)?.unwrap_or_default();
@@ -716,11 +782,8 @@ fn show_item(cfg: &Config, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn show_history(cfg: &Config, id: &str, json: bool) -> Result<()> {
-    let store = open_store(cfg)?;
-    if store.item(id)?.is_none() {
-        bail!("no item with id {id}");
-    }
+fn show_history(cfg: &Config, id: &str, source: Option<Source>, json: bool) -> Result<()> {
+    let (store, _) = store_with_item(cfg, id, source)?;
     let history = store.history(id)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&history)?);
@@ -750,7 +813,7 @@ fn show_history(cfg: &Config, id: &str, json: bool) -> Result<()> {
 }
 
 fn show_stats(cfg: &Config, json: bool) -> Result<()> {
-    let store = open_store(cfg)?;
+    let store = open_market(cfg)?;
     let stats = store.stats()?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
@@ -900,7 +963,7 @@ fn ninja_fetch_cmd(
     no_currency: bool,
     base_url: Option<String>,
 ) -> Result<()> {
-    let mut store = open_store(cfg)?;
+    let mut store = open_own(cfg)?;
     let item_types: Vec<String> = match types {
         Some(spec) => spec
             .split(',')
@@ -927,7 +990,7 @@ fn stash_watch(cfg: &Config, args: StashWatch) -> Result<()> {
         "no account configured: set BIG_OIL_ACCOUNT or \"account\" in the config file (Name#1234)"
     })?;
 
-    let mut store = open_store(cfg)?;
+    let mut store = open_own(cfg)?;
     let client = OwnClient::with_base(
         args.base_url
             .clone()
@@ -1006,12 +1069,16 @@ fn stash_pass(
             continue;
         }
         let items = client.tab(account, &args.league, tab.index)?;
+        let stash_id = tab.stash_id(&args.league);
         let stats = store.ingest_own_tab(
-            &tab.stash_id(&args.league),
-            &tab.name,
-            &tab.kind,
-            &args.league,
-            Some(account),
+            &OwnTab {
+                stash_id: &stash_id,
+                index: tab.index,
+                name: &tab.name,
+                stash_type: &tab.kind,
+                league: &args.league,
+                account: Some(account),
+            },
             &items,
         )?;
         scanned += 1;
@@ -1027,7 +1094,6 @@ fn stash_pass(
 
     let valued = store.value_items(&args.league)?;
     let drops = store.search(&SearchQuery {
-        source: Some("own".into()),
         since: Some(started),
         order: Order::Newest,
         limit: 100,
@@ -1067,7 +1133,7 @@ fn print_drops(rows: &[store::ItemRow]) {
 }
 
 fn stash_list(cfg: &Config) -> Result<()> {
-    let store = open_store(cfg)?;
+    let store = open_own(cfg)?;
     let tabs = store.own_tabs()?;
     if tabs.is_empty() {
         println!("no own tabs scanned yet: big_oil stash watch --league <league>");
@@ -1109,7 +1175,7 @@ fn stash_list(cfg: &Config) -> Result<()> {
 }
 
 fn stash_value(cfg: &Config, league: &str) -> Result<()> {
-    let mut store = open_store(cfg)?;
+    let mut store = open_own(cfg)?;
     if store.price_lines(league)?.is_empty() {
         bail!("no price snapshot for {league}: run `big_oil ninja fetch --league {league}` first");
     }
@@ -1138,18 +1204,13 @@ fn build_report(store: &Store, league: &str, settings: &DumpSettings) -> Result<
         bail!("no price snapshot for {league}: run `big_oil ninja fetch --league {league}` first");
     }
     let rates = Rates::from_lines(&lines);
-    let rows = store.search(&SearchQuery {
-        source: Some("own".into()),
-        league: Some(league.to_string()),
-        limit: 100_000,
-        ..Default::default()
-    })?;
+    let rows = store.own_rows(league)?;
     Ok(dump::analyze(&rows, &rates, store::unix_now(), settings))
 }
 
 fn run_dump(cfg: &Config, args: DumpArgs) -> Result<()> {
     let settings = dump_settings(&args)?;
-    let store = open_store(cfg)?;
+    let store = open_own(cfg)?;
     let report = build_report(&store, &args.league, &settings)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1344,12 +1405,7 @@ fn alert_dump(store: &Store, league: &str, notify: bool) {
         _ => return,
     };
     let rates = Rates::from_lines(&lines);
-    let rows = match store.search(&SearchQuery {
-        source: Some("own".into()),
-        league: Some(league.to_string()),
-        limit: 100_000,
-        ..Default::default()
-    }) {
+    let rows = match store.own_rows(league) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = %e, "dump check failed");
@@ -1381,7 +1437,7 @@ fn chaos_cell(value: f64) -> String {
 }
 
 fn run_extract(cfg: &Config, args: ExtractArgs) -> Result<()> {
-    let store = open_store(cfg)?;
+    let store = open_own(cfg)?;
     let lines = store.price_lines(&args.league)?;
     if lines.is_empty() {
         bail!(
@@ -1391,12 +1447,7 @@ fn run_extract(cfg: &Config, args: ExtractArgs) -> Result<()> {
         );
     }
     let rates = Rates::from_lines(&lines);
-    let rows = store.search(&SearchQuery {
-        source: Some("own".into()),
-        league: Some(args.league.clone()),
-        limit: 100_000,
-        ..Default::default()
-    })?;
+    let rows = store.own_rows(&args.league)?;
     let settings = ExtractSettings {
         tab: args.tab.clone(),
         min_value_chaos: args.min_value.max(0.0),
@@ -1499,7 +1550,7 @@ fn print_extract(report: &extract::Report) {
 }
 
 fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
-    let store = open_store(cfg)?;
+    let store = open_own(cfg)?;
     let lines = store.price_lines(&args.league)?;
     if lines.is_empty() {
         tracing::warn!(
@@ -1509,12 +1560,7 @@ fn run_overlay(cfg: &Config, args: OverlayArgs) -> Result<()> {
         );
     }
     let rates = Rates::from_lines(&lines);
-    let rows = store.search(&SearchQuery {
-        source: Some("own".into()),
-        league: Some(args.league.clone()),
-        limit: 100_000,
-        ..Default::default()
-    })?;
+    let rows = store.own_rows(&args.league)?;
 
     let path = match args.config.clone() {
         Some(path) => path,

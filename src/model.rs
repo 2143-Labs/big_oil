@@ -49,6 +49,8 @@ pub struct Stash {
     pub name: Option<String>,
     pub stash_type: Option<String>,
     pub league: Option<String>,
+    /// Position in the account's tab list (own tabs only).
+    pub index: Option<i64>,
     /// Items omitted unless `public`.
     pub items: Vec<Item>,
 }
@@ -81,7 +83,17 @@ pub struct Item {
     /// All mod lines (implicit/explicit/enchant/crafted/fractured/utility)
     /// flattened, for full-text search.
     pub mods_text: String,
-    /// Exact JSON as received.
+    /// Influences set to `true`, lower-cased, sorted, comma-joined.
+    pub influences: Option<String>,
+    pub fractured: bool,
+    pub synthesised: bool,
+    /// Affix counts from `extended`, when the API sends them.
+    pub prefixes: Option<i64>,
+    pub suffixes: Option<i64>,
+    /// The string frame type; stored only (matching uses `frame_type`).
+    pub frame_type_id: Option<String>,
+    /// Item JSON re-serialised from the parsed value (values preserved, key
+    /// order not).
     pub raw: String,
 }
 
@@ -133,6 +145,7 @@ impl Item {
         // full-text search.
 
         let (sockets, links) = parse_sockets(v);
+        let extended = v.get("extended");
 
         Item {
             id: str_field(v, "id").unwrap_or_default(),
@@ -157,6 +170,12 @@ impl Item {
             icon: str_field(v, "icon"),
             note: str_field(v, "note"),
             mods_text: mods.join("\n"),
+            influences: parse_influences(v),
+            fractured: bool_field(v, "fractured").unwrap_or(false),
+            synthesised: bool_field(v, "synthesised").unwrap_or(false),
+            prefixes: extended.and_then(|e| int_field(e, "prefixes")),
+            suffixes: extended.and_then(|e| int_field(e, "suffixes")),
+            frame_type_id: str_field(v, "frameTypeId"),
             raw: v.to_string(),
         }
     }
@@ -168,10 +187,28 @@ impl Item {
     }
 }
 
+/// `{"influences": {"shaper": true, "elder": true}}` → `elder,shaper`.
+fn parse_influences(v: &Value) -> Option<String> {
+    let mut names: Vec<String> = v
+        .get("influences")?
+        .as_object()?
+        .iter()
+        .filter(|(_, set)| set.as_bool() == Some(true))
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    Some(names.join(","))
+}
+
 /// Pull a numeric value out of the rendered `properties` block, which is where
 /// gem level/quality and map tier live (`{"name":"Level","values":[["20",0]]}`).
+/// Only the leading digits count: `20 (Max)` is 20, `+23%` is 23.
 fn property_number(v: &Value, key: &str) -> Option<i64> {
-    v.get("properties")?
+    let raw = v
+        .get("properties")?
         .as_array()?
         .iter()
         .find(|p| {
@@ -182,17 +219,11 @@ fn property_number(v: &Value, key: &str) -> Option<i64> {
         .get("values")?
         .get(0)?
         .get(0)?
-        .as_str()
-        .map(|raw| {
-            raw.trim()
-                .trim_start_matches('+')
-                .split('%')
-                .next()
-                .unwrap_or(raw)
-                .trim()
-                .parse::<i64>()
-                .ok()
-        })?
+        .as_str()?;
+    let raw = raw.trim();
+    let raw = raw.strip_prefix('+').unwrap_or(raw);
+    let digits: String = raw.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// `sockets` is `[{group, attr, sColour}, ...]`; `links` is the largest group.
@@ -241,6 +272,7 @@ impl PublicStashChange {
             name: self.stash,
             stash_type: self.stash_type,
             league: self.league,
+            index: None,
             items,
         }
     }
@@ -319,6 +351,26 @@ mod tests {
             "properties": [{"name": "Map Tier", "values": [["16", 0]]}]
         });
         assert_eq!(Item::from_value(&map).map_tier, Some(16));
+
+        let maxed = json!({
+            "id": "g2",
+            "properties": [{"name": "Level", "values": [["20 (Max)", 0]]}]
+        });
+        assert_eq!(Item::from_value(&maxed).gem_level, Some(20));
+    }
+
+    #[test]
+    fn reads_influences_and_affix_counts() {
+        let v = json!({
+            "id": "r",
+            "influences": {"shaper": true, "elder": true},
+            "extended": {"prefixes": 2, "suffixes": 1}
+        });
+        let item = Item::from_value(&v);
+        assert_eq!(item.influences.as_deref(), Some("elder,shaper"));
+        assert_eq!(item.prefixes, Some(2));
+        assert_eq!(item.suffixes, Some(1));
+        assert!(Item::from_value(&json!({"id": "x"})).influences.is_none());
     }
 
     #[test]

@@ -190,7 +190,7 @@ fn price_key(amount: f64, currency: &str) -> String {
 }
 
 fn row_matches(row: &ItemRow, settings: &Settings) -> bool {
-    if row.source != "own" || row.delisted_at.is_some() {
+    if row.delisted_at.is_some() {
         return false;
     }
     if let Some(tab) = &settings.tab {

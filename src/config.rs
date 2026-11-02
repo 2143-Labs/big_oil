@@ -18,7 +18,10 @@ pub struct ConfigFile {
     pub account: Option<String>,
     /// Contact string for the required `User-Agent: OAuth <id>/<ver> (contact: ...)`.
     pub contact: Option<String>,
+    /// Public stash stream database.
     pub db_path: Option<PathBuf>,
+    /// Own-tab database (your tabs and the poe.ninja snapshot).
+    pub own_db_path: Option<PathBuf>,
     pub interval_secs: Option<u64>,
 }
 
@@ -29,13 +32,16 @@ pub struct Config {
     pub poesessid: Option<String>,
     pub account: Option<String>,
     pub contact: Option<String>,
+    /// Public stash stream database.
     pub db_path: PathBuf,
+    /// Own tabs and the poe.ninja snapshot.
+    pub own_db_path: PathBuf,
     pub interval_secs: u64,
     pub config_dir: PathBuf,
 }
 
 impl Config {
-    pub fn load(db_override: Option<PathBuf>) -> Result<Config> {
+    pub fn load(db_override: Option<PathBuf>, own_db_override: Option<PathBuf>) -> Result<Config> {
         let config_dir = config_dir()?;
         let file_path = config_dir.join("config.json");
         let file: ConfigFile = match std::fs::read(&file_path) {
@@ -53,6 +59,13 @@ impl Config {
             Some(path) => path,
             None => data_dir()?.join("market.db"),
         };
+        let own_db_path = match own_db_override
+            .or_else(|| env("BIG_OIL_OWN_DB").map(PathBuf::from))
+            .or(file.own_db_path)
+        {
+            Some(path) => path,
+            None => data_dir()?.join("own.db"),
+        };
         let interval_secs = env("BIG_OIL_INTERVAL")
             .and_then(|v| v.parse().ok())
             .or(file.interval_secs)
@@ -66,6 +79,7 @@ impl Config {
             account: env("BIG_OIL_ACCOUNT").or(file.account),
             contact: env("BIG_OIL_CONTACT").or(file.contact),
             db_path,
+            own_db_path,
             interval_secs,
             config_dir,
         })
@@ -77,6 +91,11 @@ impl Config {
 
     pub fn config_path(&self) -> PathBuf {
         self.config_dir.join("config.json")
+    }
+
+    /// Unparseable stream pages are kept here for inspection.
+    pub fn bad_pages_dir(&self) -> PathBuf {
+        self.db_path.with_file_name("bad_pages")
     }
 
     /// Returns the client credentials, or a message explaining exactly what is
@@ -116,7 +135,9 @@ impl Config {
         vec![
             ("config", self.config_path().display().to_string()),
             ("token", self.token_path().display().to_string()),
-            ("database", self.db_path.display().to_string()),
+            ("market db", self.db_path.display().to_string()),
+            ("own db", self.own_db_path.display().to_string()),
+            ("bad pages", self.bad_pages_dir().display().to_string()),
         ]
     }
 }

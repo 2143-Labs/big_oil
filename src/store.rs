@@ -1,10 +1,14 @@
 //! SQLite persistence: the stash/item index plus the listing event log.
 //!
-//! Two sources share the tables. `stream` is the public stash firehose
-//! (`listed` / `price_changed` / `relisted` / `delisted` / `stash_unlisted`);
-//! `own` is the account's own tabs (`dropped` / `price_changed` / `restored` /
-//! `removed`). Either way the stream only sends tabs that changed with their
-//! full contents, so successive snapshots are diffed.
+//! The public stash stream and the account's own tabs live in separate
+//! database files with the same schema. `stream` rows are the public firehose
+//! (`listed` / `price_changed` / `relisted` / `delisted`); `own` rows are your
+//! tabs (`dropped` / `price_changed` / `restored` / `removed`). Either way a
+//! tab arrives with its full contents, so successive snapshots are diffed.
+//!
+//! A price comes from the item's own note or, when it has none, from the tab
+//! name (`~price 1 divine`): the game applies a priced tab name to every item
+//! in it that has no note of its own.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -16,7 +20,7 @@ use crate::model::Stash;
 use crate::ninja::{self, ItemView, PriceLine};
 use crate::price::{self, Price};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -34,7 +38,10 @@ CREATE TABLE IF NOT EXISTS stashes (
     source      TEXT NOT NULL DEFAULT 'stream',
     first_seen  INTEGER NOT NULL,
     last_seen   INTEGER NOT NULL,
-    delisted_at INTEGER
+    delisted_at INTEGER,
+    tab_index   INTEGER,
+    -- When the tab name last started parsing as a new price.
+    price_since INTEGER
 );
 CREATE INDEX IF NOT EXISTS stashes_league ON stashes(league);
 
@@ -75,7 +82,17 @@ CREATE TABLE IF NOT EXISTS items (
     first_seen     INTEGER NOT NULL,
     last_seen      INTEGER NOT NULL,
     delisted_at    INTEGER,
-    raw            TEXT NOT NULL
+    raw            TEXT NOT NULL,
+    -- 1 when the price came from the tab name rather than the item's note.
+    price_from_tab INTEGER NOT NULL DEFAULT 0,
+    -- When the item first appeared or its effective price last changed.
+    price_since    INTEGER,
+    influences     TEXT,
+    fractured      INTEGER NOT NULL DEFAULT 0,
+    synthesised    INTEGER NOT NULL DEFAULT 0,
+    prefixes       INTEGER,
+    suffixes       INTEGER,
+    frame_type_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS items_stash  ON items(stash_id);
 CREATE INDEX IF NOT EXISTS items_league ON items(league, base_type);
@@ -117,7 +134,10 @@ CREATE TABLE IF NOT EXISTS price_ref (
     divine        REAL,
     listing_count INTEGER,
     details_id     TEXT,
-    fetched_at    INTEGER NOT NULL
+    fetched_at    INTEGER NOT NULL,
+    item_class     INTEGER,
+    level_required INTEGER,
+    trade_id       TEXT
 );
 CREATE INDEX IF NOT EXISTS price_ref_lookup ON price_ref(league, name);
 CREATE INDEX IF NOT EXISTS price_ref_cat    ON price_ref(league, category);
@@ -145,6 +165,7 @@ CREATE INDEX IF NOT EXISTS valuations_item ON valuations(item_id, at);
 "#;
 
 const FTS_SCHEMA: &str = r#"
+DROP TRIGGER IF EXISTS items_fts_au;
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
     name, type_line, base_type, mods_text,
     content='items', content_rowid='rowid'
@@ -157,7 +178,7 @@ CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
     INSERT INTO items_fts(items_fts, rowid, name, type_line, base_type, mods_text)
     VALUES ('delete', old.rowid, old.name, old.type_line, old.base_type, old.mods_text);
 END;
-CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE ON items BEGIN
+CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF name, type_line, base_type, mods_text ON items BEGIN
     INSERT INTO items_fts(items_fts, rowid, name, type_line, base_type, mods_text)
     VALUES ('delete', old.rowid, old.name, old.type_line, old.base_type, old.mods_text);
     INSERT INTO items_fts(rowid, name, type_line, base_type, mods_text)
@@ -254,9 +275,18 @@ pub struct ItemRow {
     pub first_seen: i64,
     pub last_seen: i64,
     pub delisted_at: Option<i64>,
-    /// When the item first appeared or last changed price — the dump-tab decay
-    /// clock. Movement between tabs does not reset it.
+    /// When the item first appeared or its effective price last changed.
+    /// Movement between tabs at the same price does not reset it.
     pub price_since: Option<i64>,
+    /// The price came from the tab name, not the item's own note.
+    pub price_from_tab: bool,
+    pub stash_type: Option<String>,
+    /// Position in the account's tab list (own tabs).
+    pub tab_index: Option<i64>,
+    /// When the tab name last changed to a new price.
+    pub tab_price_since: Option<i64>,
+    /// When the tab was last scanned.
+    pub stash_last_seen: Option<i64>,
 }
 
 impl ItemRow {
@@ -296,11 +326,26 @@ pub struct OwnTabRow {
     pub stash_id: String,
     pub name: String,
     pub league: String,
+    pub index: Option<i64>,
+    pub stash_type: Option<String>,
+    /// When the tab name last changed to a new price.
+    pub price_since: Option<i64>,
     pub items: i64,
     pub live: i64,
     pub value_chaos: f64,
     pub value_divine: f64,
     pub last_seen: Option<i64>,
+}
+
+/// One of the account's own tabs, as listed by the stash endpoint.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnTab<'a> {
+    pub stash_id: &'a str,
+    pub index: i64,
+    pub name: &'a str,
+    pub stash_type: &'a str,
+    pub league: &'a str,
+    pub account: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -338,8 +383,6 @@ pub struct SearchQuery {
     pub currency: Option<String>,
     pub min_links: Option<i64>,
     pub since: Option<i64>,
-    /// `stream` (public listings) or `own` (your stash tabs).
-    pub source: Option<String>,
     pub include_delisted: bool,
     pub limit: usize,
     pub offset: usize,
@@ -362,7 +405,6 @@ impl Default for SearchQuery {
             currency: None,
             min_links: None,
             since: None,
-            source: None,
             include_delisted: false,
             limit: 25,
             offset: 0,
@@ -451,6 +493,11 @@ impl Store {
 
     pub fn next_change_id(&self) -> Result<Option<String>> {
         self.meta("next_change_id")
+    }
+
+    /// Point the stream cursor at `id` (a `next_change_id`).
+    pub fn set_cursor(&mut self, id: &str) -> Result<()> {
+        self.set_meta("next_change_id", id)
     }
 
     /// Drop the cursor so the next poll restarts from the stream head. Used
@@ -555,10 +602,12 @@ impl Store {
         }
         if let Some(v) = &q.mods {
             if self.has_fts() {
-                clauses.push(
-                    "i.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)".into(),
-                );
-                args.push(fts_query(v).into());
+                if let Some(fts) = fts_query(v) {
+                    clauses.push(
+                        "i.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)".into(),
+                    );
+                    args.push(fts.into());
+                }
             } else {
                 clauses.push("i.mods_text LIKE ? COLLATE NOCASE".into());
                 args.push(format!("%{v}%").into());
@@ -592,10 +641,6 @@ impl Store {
             clauses.push("i.first_seen >= ?".into());
             args.push(v.into());
         }
-        if let Some(v) = &q.source {
-            clauses.push("i.source = ?".into());
-            args.push(v.clone().into());
-        }
 
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
@@ -619,6 +664,26 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every live own-tab item in `league` — what the reports work from.
+    pub fn own_rows(&self, league: &str) -> Result<Vec<ItemRow>> {
+        self.search(&SearchQuery {
+            league: Some(league.to_string()),
+            limit: 100_000,
+            ..Default::default()
+        })
+    }
+
+    /// Currency rates from the stored poe.ninja snapshot.
+    pub fn rates(&self, league: &str) -> Result<crate::rates::Rates> {
+        let lines = self.price_lines(league)?;
+        if lines.is_empty() {
+            anyhow::bail!(
+                "no price snapshot for {league}: run `big_oil ninja fetch --league {league}` first"
+            );
+        }
+        Ok(crate::rates::Rates::from_lines(&lines))
+    }
+
     /// Mods text and the exact JSON for one item, kept out of `ITEM_SELECT`
     /// because they are large and only the detail view needs them.
     pub fn item_extra(&self, id: &str) -> Result<Option<(String, String)>> {
@@ -636,21 +701,18 @@ impl Store {
     /// different vocabulary: items are `dropped`, disappear as `removed`.
     pub fn ingest_own_tab(
         &mut self,
-        stash_id: &str,
-        name: &str,
-        stash_type: &str,
-        league: &str,
-        account: Option<&str>,
+        tab: &OwnTab<'_>,
         items: &[crate::model::Item],
     ) -> Result<IngestStats> {
         let now = unix_now();
         let stash = Stash {
-            id: stash_id.to_owned(),
+            id: tab.stash_id.to_owned(),
             public: true,
-            account: account.map(str::to_owned),
-            name: Some(name.to_owned()),
-            stash_type: Some(stash_type.to_owned()),
-            league: Some(league.to_owned()),
+            account: tab.account.map(str::to_owned),
+            name: Some(tab.name.to_owned()),
+            stash_type: Some(tab.stash_type.to_owned()),
+            league: Some(tab.league.to_owned()),
+            index: Some(tab.index),
             items: items.to_vec(),
         };
         let tx = self.conn.transaction()?;
@@ -765,7 +827,8 @@ impl Store {
             .flatten())
     }
 
-    /// Attach a market value to every live own-tab item that has a match.
+    /// Attach a market value to every live own-tab item that has a match, and
+    /// clear the value of items that no longer match anything.
     pub fn value_items(&mut self, league: &str) -> Result<usize> {
         let lines = self.price_lines(league)?;
         if lines.is_empty() {
@@ -803,6 +866,12 @@ impl Store {
         let mut valued = 0usize;
         for (id, view) in targets {
             let Some(line) = ninja::lookup(&lines, &view) else {
+                tx.execute(
+                    "UPDATE items SET value_chaos = NULL, value_divine = NULL, value_listings = NULL,
+                                      valued_at = ?2
+                     WHERE id = ?1 AND value_chaos IS NOT NULL",
+                    params![id, now],
+                )?;
                 continue;
             };
             tx.execute(
@@ -815,18 +884,33 @@ impl Store {
                 line.category,
                 line.name.clone().unwrap_or_else(|| "?".into())
             );
-            tx.execute(
-                "INSERT INTO valuations(item_id, at, chaos, divine, matched, listing_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    now,
-                    line.chaos,
-                    line.divine,
-                    matched,
-                    line.listing_count
-                ],
-            )?;
+            // History records changes, not every pass.
+            let latest: Option<(Option<f64>, Option<String>)> = tx
+                .query_row(
+                    "SELECT chaos, matched FROM valuations WHERE item_id = ?1
+                     ORDER BY at DESC, seq DESC LIMIT 1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let unchanged = latest.is_some_and(|(chaos, prev)| {
+                chaos.is_some_and(|c| (c - line.chaos).abs() <= 1e-9)
+                    && prev.as_deref() == Some(matched.as_str())
+            });
+            if !unchanged {
+                tx.execute(
+                    "INSERT INTO valuations(item_id, at, chaos, divine, matched, listing_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        id,
+                        now,
+                        line.chaos,
+                        line.divine,
+                        matched,
+                        line.listing_count
+                    ],
+                )?;
+            }
             valued += 1;
         }
         tx.commit()?;
@@ -852,17 +936,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// Open own tabs in tab order, with the live market value of their stock.
     pub fn own_tabs(&self) -> Result<Vec<OwnTabRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, COALESCE(s.name, '?'), COALESCE(s.league, '?'),
+                    s.tab_index, s.stash_type, s.price_since,
                     COUNT(i.id),
                     SUM(CASE WHEN i.delisted_at IS NULL THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN i.delisted_at IS NULL THEN COALESCE(i.value_chaos, 0) ELSE 0 END),
-                    SUM(CASE WHEN i.delisted_at IS NULL THEN COALESCE(i.value_divine, 0) ELSE 0 END),
+                    SUM(CASE WHEN i.delisted_at IS NULL
+                        THEN COALESCE(i.value_chaos, 0) * COALESCE(i.stack_size, 1) ELSE 0 END),
+                    SUM(CASE WHEN i.delisted_at IS NULL
+                        THEN COALESCE(i.value_divine, 0) * COALESCE(i.stack_size, 1) ELSE 0 END),
                     MAX(s.last_seen)
              FROM stashes s LEFT JOIN items i ON i.stash_id = s.id
-             WHERE s.source = 'own'
-             GROUP BY s.id ORDER BY 1",
+             WHERE s.source = 'own' AND s.delisted_at IS NULL
+             GROUP BY s.id ORDER BY s.tab_index, s.name",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -870,11 +958,14 @@ impl Store {
                     stash_id: r.get(0)?,
                     name: r.get(1)?,
                     league: r.get(2)?,
-                    items: r.get(3)?,
-                    live: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    value_chaos: r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                    value_divine: r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
-                    last_seen: r.get(7)?,
+                    index: r.get(3)?,
+                    stash_type: r.get(4)?,
+                    price_since: r.get(5)?,
+                    items: r.get(6)?,
+                    live: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    value_chaos: r.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                    value_divine: r.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                    last_seen: r.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -949,72 +1040,104 @@ impl Store {
     }
 }
 
-const ITEM_SELECT: &str =
-    "SELECT i.id, i.stash_id, s.name, i.account, i.league, i.name, i.type_line,
-        i.base_type, i.rarity, i.ilvl, i.stack_size, i.sockets, i.links, i.corrupted, i.note,
-        i.price_amount, i.price_currency, i.price_type, i.source, i.value_chaos, i.value_divine,
-        i.valued_at, i.value_listings, i.identified, i.x, i.y, i.w, i.h,
-        i.first_seen, i.last_seen, i.delisted_at, i.frame_type,
-        COALESCE(
-            (SELECT MAX(l.at) FROM listings l WHERE l.item_id = i.id AND l.event = 'price_changed'),
-            (SELECT MIN(l.at) FROM listings l WHERE l.item_id = i.id AND l.event IN ('listed', 'dropped')),
-            i.first_seen
-        )
+const ITEM_SELECT: &str = "SELECT
+        i.id AS id, i.stash_id AS stash_id, s.name AS stash_name, i.account AS account,
+        i.league AS league, i.name AS name, i.type_line AS type_line, i.base_type AS base_type,
+        i.rarity AS rarity, i.ilvl AS ilvl, i.stack_size AS stack_size, i.sockets AS sockets,
+        i.links AS links, i.corrupted AS corrupted, i.note AS note,
+        i.price_amount AS price_amount, i.price_currency AS price_currency,
+        i.price_type AS price_type, i.source AS source, i.value_chaos AS value_chaos,
+        i.value_divine AS value_divine, i.valued_at AS valued_at,
+        i.value_listings AS value_listings, i.identified AS identified,
+        i.frame_type AS frame_type, i.x AS x, i.y AS y, i.w AS w, i.h AS h,
+        i.first_seen AS first_seen, i.last_seen AS last_seen, i.delisted_at AS delisted_at,
+        i.price_since AS price_since, i.price_from_tab AS price_from_tab,
+        s.stash_type AS stash_type, s.tab_index AS tab_index,
+        s.price_since AS tab_price_since, s.last_seen AS stash_last_seen
     FROM items i LEFT JOIN stashes s ON s.id = i.stash_id";
 
 fn item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
     Ok(ItemRow {
-        id: r.get(0)?,
-        stash_id: r.get(1)?,
-        stash_name: r.get(2)?,
-        account: r.get(3)?,
-        league: r.get(4)?,
-        name: r.get(5)?,
-        type_line: r.get(6)?,
-        base_type: r.get(7)?,
-        rarity: r.get(8)?,
-        ilvl: r.get(9)?,
-        stack_size: r.get(10)?,
-        sockets: r.get(11)?,
-        links: r.get(12)?,
-        corrupted: r.get::<_, i64>(13)? != 0,
-        note: r.get(14)?,
-        price_amount: r.get(15)?,
-        price_currency: r.get(16)?,
-        price_type: r.get(17)?,
-        source: r.get(18)?,
-        value_chaos: r.get(19)?,
-        value_divine: r.get(20)?,
-        valued_at: r.get(21)?,
-        w: r.get(26)?,
-        h: r.get(27)?,
-        first_seen: r.get(28)?,
-        last_seen: r.get(29)?,
-        delisted_at: r.get(30)?,
-        frame_type: r.get(31)?,
-        price_since: r.get(32)?,
-        value_listings: r.get(22)?,
-        identified: r.get::<_, Option<i64>>(23)?.map(|v| v != 0),
-        x: r.get(24)?,
-        y: r.get(25)?,
+        id: r.get("id")?,
+        stash_id: r.get("stash_id")?,
+        stash_name: r.get("stash_name")?,
+        account: r.get("account")?,
+        league: r.get("league")?,
+        name: r.get("name")?,
+        type_line: r.get("type_line")?,
+        base_type: r.get("base_type")?,
+        rarity: r.get("rarity")?,
+        ilvl: r.get("ilvl")?,
+        stack_size: r.get("stack_size")?,
+        sockets: r.get("sockets")?,
+        links: r.get("links")?,
+        corrupted: r.get::<_, i64>("corrupted")? != 0,
+        note: r.get("note")?,
+        price_amount: r.get("price_amount")?,
+        price_currency: r.get("price_currency")?,
+        price_type: r.get("price_type")?,
+        source: r.get("source")?,
+        value_chaos: r.get("value_chaos")?,
+        value_divine: r.get("value_divine")?,
+        valued_at: r.get("valued_at")?,
+        value_listings: r.get("value_listings")?,
+        identified: r.get::<_, Option<i64>>("identified")?.map(|v| v != 0),
+        frame_type: r.get("frame_type")?,
+        x: r.get("x")?,
+        y: r.get("y")?,
+        w: r.get("w")?,
+        h: r.get("h")?,
+        first_seen: r.get("first_seen")?,
+        last_seen: r.get("last_seen")?,
+        delisted_at: r.get("delisted_at")?,
+        price_since: r.get("price_since")?,
+        price_from_tab: r.get::<_, i64>("price_from_tab")? != 0,
+        stash_type: r.get("stash_type")?,
+        tab_index: r.get("tab_index")?,
+        tab_price_since: r.get("tab_price_since")?,
+        stash_last_seen: r.get("stash_last_seen")?,
     })
 }
 
 /// FTS5 query syntax is its own language; escape user input so that a mod
-/// search like `+40% to Fire` cannot raise a syntax error.
-fn fts_query(input: &str) -> String {
-    input
+/// search like `+40% to Fire` cannot raise a syntax error. The column filter
+/// keeps `--mods` to mod text (names and bases have their own flags).
+fn fts_query(input: &str) -> Option<String> {
+    let words: Vec<String> = input
         .split_whitespace()
-        .map(|word| format!("\"{}\"", word.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|word| word.replace('"', ""))
+        .filter(|word| !word.is_empty())
+        .map(|word| format!("\"{word}\""))
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(format!("mods_text : ({})", words.join(" ")))
 }
 
 #[derive(Debug, Clone)]
 struct ExistingItem {
-    price_amount: Option<f64>,
-    price_currency: Option<String>,
+    price: Option<Price>,
     delisted_at: Option<i64>,
+    raw: String,
+}
+
+const EXISTING_COLUMNS: &str = "price_amount, price_currency, price_type, delisted_at, raw";
+
+/// Read `EXISTING_COLUMNS` starting at column `at`.
+fn existing_item(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<ExistingItem> {
+    let amount: Option<f64> = r.get(at)?;
+    let currency: Option<String> = r.get(at + 1)?;
+    let kind: Option<String> = r.get(at + 2)?;
+    Ok(ExistingItem {
+        price: amount.zip(currency).map(|(amount, currency)| Price {
+            kind: kind.unwrap_or_else(|| "b/o".into()),
+            amount,
+            currency,
+        }),
+        delisted_at: r.get(at + 3)?,
+        raw: r.get(at + 4)?,
+    })
 }
 
 fn ingest_stash(
@@ -1027,16 +1150,43 @@ fn ingest_stash(
 ) -> Result<()> {
     stats.stashes += 1;
 
+    // A priced tab name prices every item in the tab that has no note.
+    let stored: Option<(Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT name, price_since FROM stashes WHERE id = ?1",
+            [&stash.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let tab_price = stash.name.as_deref().and_then(price::parse_note);
+    let price_since = match (&stash.name, stored) {
+        // An unlist event carries no name: the tab's price did not change.
+        (None, Some((_, since))) => since,
+        (None, None) => None,
+        (Some(_), None) => tab_price.as_ref().map(|_| now),
+        (Some(_), Some((prev_name, since))) => {
+            let prev = prev_name.as_deref().and_then(price::parse_note);
+            if price::same_price(prev.as_ref(), tab_price.as_ref()) {
+                since
+            } else {
+                tab_price.as_ref().map(|_| now)
+            }
+        }
+    };
+
     tx.execute(
-        "INSERT INTO stashes(id, account, name, stash_type, league, public, source, first_seen, last_seen, delisted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, ?7, ?7, NULL)
+        "INSERT INTO stashes(id, account, name, stash_type, league, public, source, first_seen,
+                             last_seen, delisted_at, tab_index, price_since)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, ?7, ?7, NULL, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
-             account    = COALESCE(excluded.account, stashes.account),
-             name       = COALESCE(excluded.name, stashes.name),
-             stash_type = COALESCE(excluded.stash_type, stashes.stash_type),
-             league     = COALESCE(excluded.league, stashes.league),
-             public     = excluded.public,
-             last_seen  = excluded.last_seen",
+             account     = COALESCE(excluded.account, stashes.account),
+             name        = COALESCE(excluded.name, stashes.name),
+             stash_type  = COALESCE(excluded.stash_type, stashes.stash_type),
+             league      = COALESCE(excluded.league, stashes.league),
+             public      = excluded.public,
+             last_seen   = excluded.last_seen,
+             tab_index   = COALESCE(excluded.tab_index, stashes.tab_index),
+             price_since = ?10",
         params![
             stash.id,
             stash.account,
@@ -1045,25 +1195,20 @@ fn ingest_stash(
             stash.league,
             stash.public as i64,
             now,
-            origin.source()
+            origin.source(),
+            stash.index,
+            price_since,
         ],
     )?;
 
     let open_items = {
-        let mut stmt = tx.prepare(
-            "SELECT id, price_amount, price_currency, delisted_at
-             FROM items WHERE stash_id = ?1 AND delisted_at IS NULL",
-        )?;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, {EXISTING_COLUMNS}
+             FROM items WHERE stash_id = ?1 AND delisted_at IS NULL"
+        ))?;
         let map: HashMap<String, ExistingItem> = stmt
             .query_map([&stash.id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    ExistingItem {
-                        price_amount: r.get(1)?,
-                        price_currency: r.get(2)?,
-                        delisted_at: r.get(3)?,
-                    },
-                ))
+                Ok((r.get::<_, String>(0)?, existing_item(r, 1)?))
             })?
             .collect::<Result<HashMap<_, _>, _>>()?;
         map
@@ -1076,7 +1221,7 @@ fn ingest_stash(
             params![stash.id, now],
         )?;
         for item_id in open_items.keys() {
-            close_item(tx, item_id, &stash.id, stash, origin, change_id, now)?;
+            close_item(tx, item_id, stash, origin, change_id, now)?;
             stats.delisted += 1;
         }
         stats.unlisted_stashes += 1;
@@ -1091,34 +1236,36 @@ fn ingest_stash(
     let incoming: HashSet<&str> = stash.items.iter().map(|i| i.id.as_str()).collect();
 
     for item in &stash.items {
-        let parsed = item.note.as_deref().and_then(price::parse_note);
-        let (amount, currency, kind) = match &parsed {
-            Some(p) => (
-                Some(p.amount),
-                Some(p.currency.as_str()),
-                Some(p.kind.as_str()),
-            ),
-            None => (None, None, None),
+        // The item's own note always wins over the tab name.
+        let note_price = item.note.as_deref().and_then(price::parse_note);
+        let (effective, from_tab) = match note_price {
+            Some(p) => (Some(p), false),
+            None => (tab_price.clone(), tab_price.is_some()),
         };
 
-        let existing = open_items.get(&item.id);
         // The item may exist in another stash (moved between tabs) or be
         // currently delisted; either way it is not a new listing.
-        let previous = match existing {
+        let previous = match open_items.get(&item.id) {
             Some(e) => Some(e.clone()),
             None => select_item(tx, &item.id)?,
         };
+        let changed = previous
+            .as_ref()
+            .is_some_and(|p| !price::same_price(p.price.as_ref(), effective.as_ref()));
 
-        upsert_item(
-            tx,
-            item,
-            stash,
-            amount,
-            currency,
-            kind,
-            origin.source(),
-            now,
-        )?;
+        if previous.as_ref().is_some_and(|p| p.raw == item.raw) {
+            touch_item(tx, &item.id, stash, effective.as_ref(), from_tab, now)?;
+        } else {
+            upsert_item(
+                tx,
+                item,
+                stash,
+                effective.as_ref(),
+                from_tab,
+                origin.source(),
+                now,
+            )?;
+        }
         stats.items_new += usize::from(previous.is_none());
 
         match &previous {
@@ -1127,7 +1274,7 @@ fn ingest_stash(
                 item.id.as_str(),
                 stash,
                 origin.listed(),
-                &parsed,
+                &effective,
                 None,
                 change_id,
                 now,
@@ -1140,20 +1287,20 @@ fn ingest_stash(
                         item.id.as_str(),
                         stash,
                         origin.relisted(),
-                        &parsed,
+                        &effective,
                         None,
                         change_id,
                         now,
                     )?;
                 }
-                if price_changed(prev, amount, currency) {
+                if changed {
                     stats.price_changes += 1;
                     insert_event(
                         tx,
                         item.id.as_str(),
                         stash,
                         "price_changed",
-                        &parsed,
+                        &effective,
                         Some(prev),
                         change_id,
                         now,
@@ -1161,14 +1308,19 @@ fn ingest_stash(
                 }
             }
         }
+        if changed {
+            tx.execute(
+                "UPDATE items SET price_since = ?2 WHERE id = ?1",
+                params![item.id, now],
+            )?;
+        }
     }
 
     // Anything we had open for this stash that the new snapshot does not
     // contain was removed or sold.
-    for (item_id, prev) in &open_items {
+    for item_id in open_items.keys() {
         if !incoming.contains(item_id.as_str()) {
-            close_item(tx, item_id, &stash.id, stash, origin, change_id, now)?;
-            let _ = prev;
+            close_item(tx, item_id, stash, origin, change_id, now)?;
             stats.delisted += 1;
         }
     }
@@ -1176,44 +1328,50 @@ fn ingest_stash(
     Ok(())
 }
 
-fn price_changed(prev: &ExistingItem, amount: Option<f64>, currency: Option<&str>) -> bool {
-    let same_amount = match (prev.price_amount, amount) {
-        (Some(a), Some(b)) => (a - b).abs() < 1e-9,
-        (None, None) => true,
-        _ => false,
-    };
-    let same_currency = match (prev.price_currency.as_deref(), currency) {
-        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-        (None, None) => true,
-        _ => false,
-    };
-    !(same_amount && same_currency)
-}
-
 fn select_item(tx: &Transaction<'_>, item_id: &str) -> Result<Option<ExistingItem>> {
     Ok(tx
         .query_row(
-            "SELECT price_amount, price_currency, delisted_at FROM items WHERE id = ?1",
+            &format!("SELECT {EXISTING_COLUMNS} FROM items WHERE id = ?1"),
             [item_id],
-            |r| {
-                Ok(ExistingItem {
-                    price_amount: r.get(0)?,
-                    price_currency: r.get(1)?,
-                    delisted_at: r.get(2)?,
-                })
-            },
+            |r| existing_item(r, 0),
         )
         .optional()?)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// An item seen again unchanged: only where it is, that it is live, and its
+/// effective price (the tab name may have changed) need writing. Leaving the
+/// text columns alone keeps the FTS update trigger quiet.
+fn touch_item(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    stash: &Stash,
+    effective: Option<&Price>,
+    from_tab: bool,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE items SET stash_id = ?2, last_seen = ?3, delisted_at = NULL, price_amount = ?4,
+                          price_currency = ?5, price_type = ?6, price_from_tab = ?7
+         WHERE id = ?1",
+        params![
+            item_id,
+            stash.id,
+            now,
+            effective.map(|p| p.amount),
+            effective.map(|p| p.currency.as_str()),
+            effective.map(|p| p.kind.as_str()),
+            from_tab as i64,
+        ],
+    )?;
+    Ok(())
+}
+
 fn upsert_item(
     tx: &Transaction<'_>,
     item: &crate::model::Item,
     stash: &Stash,
-    amount: Option<f64>,
-    currency: Option<&str>,
-    kind: Option<&str>,
+    effective: Option<&Price>,
+    from_tab: bool,
     source: &str,
     now: i64,
 ) -> Result<()> {
@@ -1222,9 +1380,11 @@ fn upsert_item(
             id, stash_id, league, account, name, type_line, base_type, rarity, frame_type, ilvl,
             stack_size, sockets, links, corrupted, identified, icon, note, price_amount,
             price_currency, price_type, mods_text, gem_level, gem_quality, map_tier, x, y, w, h,
-            source, first_seen, last_seen, delisted_at, raw)
+            source, first_seen, last_seen, delisted_at, raw, price_from_tab, price_since,
+            influences, fractured, synthesised, prefixes, suffixes, frame_type_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?30, NULL, ?31)
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?30, NULL, ?31,
+                 ?32, ?30, ?33, ?34, ?35, ?36, ?37, ?38)
          ON CONFLICT(id) DO UPDATE SET
             stash_id       = excluded.stash_id,
             league         = COALESCE(excluded.league, items.league),
@@ -1256,7 +1416,14 @@ fn upsert_item(
             source         = excluded.source,
             last_seen      = excluded.last_seen,
             delisted_at    = NULL,
-            raw            = excluded.raw",
+            raw            = excluded.raw,
+            price_from_tab = excluded.price_from_tab,
+            influences     = excluded.influences,
+            fractured      = excluded.fractured,
+            synthesised    = excluded.synthesised,
+            prefixes       = excluded.prefixes,
+            suffixes       = excluded.suffixes,
+            frame_type_id  = excluded.frame_type_id",
         params![
             item.id,
             stash.id,
@@ -1275,9 +1442,9 @@ fn upsert_item(
             item.identified.map(|b| b as i64),
             item.icon,
             item.note,
-            amount,
-            currency,
-            kind,
+            effective.map(|p| p.amount),
+            effective.map(|p| p.currency.as_str()),
+            effective.map(|p| p.kind.as_str()),
             item.mods_text,
             item.gem_level,
             item.gem_quality,
@@ -1289,6 +1456,13 @@ fn upsert_item(
             source,
             now,
             item.raw,
+            from_tab as i64,
+            item.influences,
+            item.fractured as i64,
+            item.synthesised as i64,
+            item.prefixes,
+            item.suffixes,
+            item.frame_type_id,
         ],
     )?;
     Ok(())
@@ -1297,7 +1471,6 @@ fn upsert_item(
 fn close_item(
     tx: &Transaction<'_>,
     item_id: &str,
-    stash_id: &str,
     stash: &Stash,
     origin: Origin,
     change_id: &str,
@@ -1308,21 +1481,14 @@ fn close_item(
         params![item_id, now],
     )?;
     if changed > 0 {
-        let price = {
-            let mut stmt =
-                tx.prepare("SELECT price_amount, price_currency FROM items WHERE id = ?1")?;
-            stmt.query_row([item_id], |r| {
-                Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<String>>(1)?))
-            })
+        let old = tx
+            .query_row(
+                &format!("SELECT {EXISTING_COLUMNS} FROM items WHERE id = ?1"),
+                [item_id],
+                |r| existing_item(r, 0),
+            )
             .optional()?
-        };
-        let old = price.and_then(|(a, c)| {
-            Some(Price {
-                kind: "b/o".into(),
-                amount: a?,
-                currency: c?,
-            })
-        });
+            .and_then(|e| e.price);
         insert_event(
             tx,
             item_id,
@@ -1333,7 +1499,6 @@ fn close_item(
             change_id,
             now,
         )?;
-        let _ = stash_id;
     }
     Ok(())
 }
@@ -1361,8 +1526,10 @@ fn insert_event(
             event,
             price.as_ref().map(|p| p.amount),
             price.as_ref().map(|p| p.currency.as_str()),
-            previous.and_then(|p| p.price_amount),
-            previous.and_then(|p| p.price_currency.as_deref()),
+            previous.and_then(|p| p.price.as_ref()).map(|p| p.amount),
+            previous
+                .and_then(|p| p.price.as_ref())
+                .map(|p| p.currency.as_str()),
             now,
             change_id,
         ],
@@ -1370,7 +1537,7 @@ fn insert_event(
     Ok(())
 }
 
-/// Bring databases created before schema v2 up to date. `CREATE TABLE IF NOT
+/// Bring databases created by older versions up to date. `CREATE TABLE IF NOT
 /// EXISTS` handles new tables; columns need explicit checks.
 fn migrate(conn: &Connection) -> Result<()> {
     let has_column = |table: &str, column: &str| -> Result<bool> {
@@ -1399,12 +1566,38 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("items", "w", "INTEGER"),
         ("items", "h", "INTEGER"),
         ("items", "value_listings", "INTEGER"),
+        ("stashes", "tab_index", "INTEGER"),
+        ("stashes", "price_since", "INTEGER"),
+        ("items", "price_from_tab", "INTEGER NOT NULL DEFAULT 0"),
+        ("items", "price_since", "INTEGER"),
+        ("items", "influences", "TEXT"),
+        ("items", "fractured", "INTEGER NOT NULL DEFAULT 0"),
+        ("items", "synthesised", "INTEGER NOT NULL DEFAULT 0"),
+        ("items", "prefixes", "INTEGER"),
+        ("items", "suffixes", "INTEGER"),
+        ("items", "frame_type_id", "TEXT"),
+        ("price_ref", "item_class", "INTEGER"),
+        ("price_ref", "level_required", "INTEGER"),
+        ("price_ref", "trade_id", "TEXT"),
     ] {
         if !has_column(table, column)? {
             conn.execute(
                 &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
                 [],
             )?;
+            if (table, column) == ("items", "price_since") {
+                // Before v3 the decay clock was derived from the event log on
+                // every read; store it once.
+                conn.execute(
+                    "UPDATE items SET price_since = COALESCE(
+                        (SELECT MAX(l.at) FROM listings l
+                         WHERE l.item_id = items.id AND l.event = 'price_changed'),
+                        (SELECT MIN(l.at) FROM listings l
+                         WHERE l.item_id = items.id AND l.event IN ('listed', 'dropped')),
+                        first_seen)",
+                    [],
+                )?;
+            }
         }
     }
     Ok(())

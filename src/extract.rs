@@ -133,7 +133,7 @@ impl Report {
 pub fn analyze(rows: &[ItemRow], rates: &Rates, settings: &Settings) -> Report {
     let live: Vec<&ItemRow> = rows
         .iter()
-        .filter(|r| r.source == "own" && r.delisted_at.is_none())
+        .filter(|r| r.delisted_at.is_none())
         .filter(|r| match &settings.tab {
             Some(tab) => r
                 .stash_name
