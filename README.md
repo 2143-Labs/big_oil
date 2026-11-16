@@ -333,6 +333,62 @@ hotkey toggles it. It snapshots the index when it starts and warns when the tab
 was last scanned more than 15 minutes ago; it needs `stash watch` to have seen
 that tab, since item positions come from the stash API.
 
+## Currency exchange
+
+GGG publishes an hourly digest of every currency-exchange market, and it is
+free to read:
+
+```
+GET https://web.poecdn.com/api/currency-exchange[/<realm>][/<id>]
+```
+
+No account, no cookie, no token: one request returns the markets of one hour
+for every league, with volumes, stock and ratio spreads.
+
+This is a documented endpoint, not a discovered one. It is listed in GGG's API
+reference
+(<https://www.pathofexile.com/developer/docs/reference#currencyexchange>), and
+the 3.29.0 changelog says *"The Currency Exchange endpoint is now available
+publicly. Use the CDN API to load cached copies of the data"* — `web.poecdn.com`
+is that CDN. The Terms of Use (§7i) prohibit reverse-engineering endpoints
+*outside* the documented API; this one is inside it, so the collector is a
+client of the published API rather than a scraper. It sends a contact address
+in its User-Agent, as GGG's guidelines ask.
+
+```
+big_oil [--exchange-db PATH] exchange <command>
+
+fetch    Store every hour from the live edge back to --since (--since, --base-url,
+         --pace-ms). Stored hours are skipped without a request, so --since also
+         repairs a hole.
+serve    Collect an hour at a time, forever, and serve /metrics and /healthz on
+         --listen (default 127.0.0.1:9100). --since applies to an empty database
+         only: a restart must never silently re-backfill.
+verify   Prove the stored hours are contiguous and that every ledger row still
+         has its markets. Prints each problem ("missing <hour>", "ledger says N
+         markets, M stored", "payload hash changed") and exits 1. --recheck
+         re-fetches every hour and compares its hash.
+stats    Row counts, the date range, leagues, and the busiest pairs with their
+         chaos prices.
+```
+
+`--since` takes unix seconds or RFC3339 (`2026-11-13T20:00:00Z`), floored to the
+hour. The `Covens` league began at `1794600000`. Everything is written to
+`exchange.db` (`--exchange-db`, or `BIG_OIL_EXCHANGE_DB`), beside the other two
+databases.
+
+Every league in each payload is stored, not only the current one, and a market
+with no trades is stored too: the absence of trades is data. Prices are derived
+at query time. The price of X in Y is `ratio(Y) / ratio(X)`, which only works
+directly against chaos — the ~500 markets with no chaos side need multi-hop
+conversion, which is analysis-time work and deliberately not done here.
+
+Each raw payload is also archived gzipped in `exchange-raw/` beside the database
+(`<hour>.json.gz`, around 10 KB per hour), because GGG documents that old
+history may be removed. The ledger stores a sha256 of the uncompressed payload,
+so `exchange verify --recheck` can prove an archived hour still matches what the
+API serves.
+
 ## Build
 
 ```sh
@@ -362,6 +418,7 @@ dump       Underpriced items per tab, and time at price (--tab, --pull,
            --min-value, --json, --notify)
 extract    Triage one identified tab: what to pull, what is stuck
 overlay    In-game frames around the items in one tab (Wayland)
+exchange   fetch | serve | verify | stats   (GGG's hourly currency exchange)
 ```
 
 Search filters: `--league --name --base --rarity --account --mods --min-ilvl
@@ -377,7 +434,8 @@ fractured/utility mod lines only (names and bases have their own filters).
 
 Two files with the same schema, under `$XDG_DATA_HOME/big_oil/` (WAL):
 `market.db` for the public stream and `own.db` for your tabs and the poe.ninja
-snapshot. They never share rows.
+snapshot. They never share rows, and neither has anything to do with the third
+file, `exchange.db` (see Currency exchange), which has its own schema.
 
 | table      | contents |
 | ---------- | -------- |

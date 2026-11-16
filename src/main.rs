@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,6 +16,11 @@ use big_oil::auth;
 use big_oil::client::{self, BadPage, Client, HttpStatus};
 use big_oil::config::{self, Config};
 use big_oil::dump::{self, Settings as DumpSettings};
+use big_oil::exchange::store::ExchangeStore;
+use big_oil::exchange::{
+    DEFAULT_BASE_URL, HOUR, report as exchange_report, serve as exchange_serve,
+    walk as exchange_walk,
+};
 use big_oil::extract::{self, Settings as ExtractSettings};
 use big_oil::listing::{self, Rule, TabSelector};
 use big_oil::model::StashPage;
@@ -39,6 +45,10 @@ struct Cli {
     /// Own-tab database (default: $XDG_DATA_HOME/big_oil/own.db)
     #[arg(long, global = true, value_name = "PATH", env = "BIG_OIL_OWN_DB")]
     own_db: Option<PathBuf>,
+
+    /// Currency-exchange database (default: $XDG_DATA_HOME/big_oil/exchange.db)
+    #[arg(long, global = true, value_name = "PATH", env = "BIG_OIL_EXCHANGE_DB")]
+    exchange_db: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -131,6 +141,8 @@ enum Command {
     Extract(ExtractArgs),
     /// In-game overlay: coloured frames around the items in the open tab
     Overlay(OverlayArgs),
+    /// GGG's hourly currency-exchange data (no auth)
+    Exchange(Exchange),
     /// Print config, token and database paths
     Paths,
 }
@@ -346,6 +358,53 @@ struct OverlayArgs {
 }
 
 #[derive(clap::Args)]
+struct Exchange {
+    #[command(subcommand)]
+    cmd: ExchangeCommand,
+}
+
+#[derive(clap::Subcommand)]
+enum ExchangeCommand {
+    /// Store every hour from the live edge back to --since (one-shot)
+    Fetch {
+        /// First hour: unix seconds or RFC3339 (default: after the newest stored hour)
+        #[arg(long)]
+        since: Option<String>,
+        /// Override the endpoint (the tests point this at a mock)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Milliseconds between requests
+        #[arg(long, default_value_t = 1000)]
+        pace_ms: u64,
+    },
+    /// Collect an hour at a time and serve /metrics and /healthz (long running)
+    Serve {
+        /// First hour, only honoured when the database is empty
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value = "127.0.0.1:9100")]
+        listen: String,
+        #[arg(long, default_value_t = 1000)]
+        pace_ms: u64,
+    },
+    /// Prove the stored hours are complete
+    Verify {
+        /// Expect contiguity from this hour (unix seconds or RFC3339)
+        #[arg(long)]
+        since: Option<String>,
+        /// Re-fetch every hour and compare its hash
+        #[arg(long)]
+        recheck: bool,
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// Row counts, date range, leagues and the busiest pairs
+    Stats,
+}
+
+#[derive(clap::Args)]
 struct Search {
     #[arg(long)]
     league: Option<String>,
@@ -402,6 +461,12 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
+    // The exchange commands need no account, league or token, and resolving the
+    // config would need a config directory — which a non-root container does
+    // not have. Dispatch them before anything reads the config file.
+    if matches!(cli.command, Command::Exchange(_)) {
+        return run_exchange(&cli);
+    }
     let cfg = Config::load(cli.db, cli.own_db)?;
 
     match cli.command {
@@ -430,12 +495,164 @@ fn run() -> Result<()> {
         Command::Dump(args) => run_dump(&cfg, args),
         Command::Extract(args) => run_extract(&cfg, args),
         Command::Overlay(args) => run_overlay(&cfg, args),
+        Command::Exchange(_) => unreachable!("dispatched before Config::load"),
         Command::Paths => {
             for (name, path) in cfg.layout() {
                 println!("{name:<9} {path}");
             }
             Ok(())
         }
+    }
+}
+
+/// GGG's hourly currency exchange: fetch, serve, verify, stats.
+fn run_exchange(cli: &Cli) -> Result<()> {
+    let Command::Exchange(args) = &cli.command else {
+        return Ok(());
+    };
+    let db = exchange_db_path(cli)?;
+    let user_agent = exchange_user_agent();
+    match &args.cmd {
+        ExchangeCommand::Fetch {
+            since,
+            base_url,
+            pace_ms,
+        } => {
+            let mut store = ExchangeStore::open(&db)?;
+            // An explicit --since walks from there even on a populated ledger:
+            // stored hours are skipped without a request, so this is also how a
+            // hole is repaired. `serve` keeps ignoring --since, because the
+            // deployment passes one on every boot.
+            let start = match (since, store.newest_hour()?) {
+                (Some(raw), _) => parse_since(raw)?,
+                (None, Some(newest)) => newest + HOUR,
+                (None, None) => return Err(empty_exchange_db()),
+            };
+            let walked = exchange_walk::walk(
+                &mut store,
+                &exchange_base(base_url),
+                &user_agent,
+                start,
+                Duration::from_millis(*pace_ms),
+                &exchange_raw_dir(&db),
+                store::unix_now(),
+            )?;
+            println!(
+                "stored {} hours, cursor {}",
+                walked.stored.len(),
+                walked.cursor
+            );
+            Ok(())
+        }
+        ExchangeCommand::Serve {
+            since,
+            base_url,
+            listen,
+            pace_ms,
+        } => {
+            let addr: SocketAddr = listen
+                .parse()
+                .map_err(|_| anyhow::anyhow!("--listen must be host:port, got {listen}"))?;
+            let since = since.as_deref().map(parse_since).transpose()?;
+            exchange_serve::run(
+                db,
+                exchange_base(base_url),
+                user_agent,
+                since,
+                addr,
+                Duration::from_millis(*pace_ms),
+            )
+        }
+        ExchangeCommand::Verify {
+            since,
+            recheck,
+            base_url,
+        } => {
+            let store = ExchangeStore::open(&db)?;
+            let since = since.as_deref().map(parse_since).transpose()?;
+            let report = exchange_report::verify(
+                &store,
+                since,
+                *recheck,
+                &exchange_base(base_url),
+                &user_agent,
+                Duration::from_millis(1000),
+            )?;
+            if report.is_clean() {
+                println!(
+                    "clean ({} hours, {}..{})",
+                    report.hours,
+                    report.first.unwrap_or(0),
+                    report.last.unwrap_or(0)
+                );
+                return Ok(());
+            }
+            print!("{}", report.describe());
+            // A gap or a short hour is a failed check, not a usage error.
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            std::process::exit(1);
+        }
+        ExchangeCommand::Stats => {
+            let store = ExchangeStore::open(&db)?;
+            print!("{}", exchange_report::stats(&store, store::unix_now())?);
+            Ok(())
+        }
+    }
+}
+
+fn exchange_db_path(cli: &Cli) -> Result<PathBuf> {
+    match &cli.exchange_db {
+        Some(path) => Ok(path.clone()),
+        None => Ok(config::data_dir()?.join("exchange.db")),
+    }
+}
+
+/// The user-agent carries a contact, which GGG's guidelines ask for. There is no
+/// OAuth client on an unauthenticated endpoint, so the plain app form is the
+/// default; a configured client id switches to the documented `OAuth` form.
+fn exchange_user_agent() -> String {
+    let contact = std::env::var("BIG_OIL_CONTACT").unwrap_or_else(|_| "unset".into());
+    match std::env::var("BIG_OIL_CLIENT_ID") {
+        Ok(id) if !id.is_empty() => config::user_agent(&id, &contact),
+        _ => config::app_user_agent(&contact),
+    }
+}
+
+fn exchange_base(base_url: &Option<String>) -> String {
+    match base_url {
+        Some(base) => base.trim_end_matches('/').to_string(),
+        None => DEFAULT_BASE_URL.to_string(),
+    }
+}
+
+/// The raw payloads live beside the database, never at a configured path, so a
+/// database copied to another machine takes its archive with it.
+fn exchange_raw_dir(db: &std::path::Path) -> PathBuf {
+    db.with_file_name("exchange-raw")
+}
+
+fn empty_exchange_db() -> anyhow::Error {
+    anyhow::anyhow!(
+        "the exchange database is empty: pass --since for the first run \
+         (the Covens league started at 1794600000)"
+    )
+}
+
+/// `--since` for exchange hours: unix seconds or RFC3339, floored to the hour.
+/// Unlike `render::parse_since`, which is relative (`6h`), this is absolute:
+/// hours are addressed by their id.
+fn parse_since(raw: &str) -> Result<i64> {
+    let raw = raw.trim();
+    let unix = if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+        raw.parse::<i64>().ok()
+    } else {
+        time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .map(|t| t.unix_timestamp())
+    };
+    match unix {
+        Some(t) => Ok(t - t.rem_euclid(HOUR)),
+        None => bail!("--since must be unix seconds or RFC3339 UTC, got {raw}"),
     }
 }
 
