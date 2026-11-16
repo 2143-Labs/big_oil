@@ -177,3 +177,118 @@ fn handle(
     stream.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const CHAOS: &str = "Metadata/Items/Currency/CurrencyRerollRare";
+    const DIVINE: &str = "Metadata/Items/Currency/CurrencyModValues";
+
+    /// Serves exactly one request through `handle`, returning the response text.
+    fn one_request<S>(store: ExchangeStore, send: S) -> String
+    where
+        S: FnOnce(&mut TcpStream),
+    {
+        let errors = AtomicU64::new(0);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle(&mut stream, &store, &errors, 0).unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        send(&mut client);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    fn store_with_one_hour() -> ExchangeStore {
+        let mut store = ExchangeStore::open_memory().unwrap();
+        let page = serde_json::from_value(serde_json::json!({
+            "next_change_id": crate::exchange::HOUR,
+            "markets": [{
+                "league": "Covens",
+                "market_id": format!("{CHAOS}|{DIVINE}"),
+                "market_pair": [CHAOS, DIVINE],
+                "volume_traded": dict(),
+                "lowest_ratio": json_dict(&[(CHAOS, 850), (DIVINE, 1)]),
+                "highest_ratio": json_dict(&[(CHAOS, 850), (DIVINE, 1)]),
+            }]
+        }))
+        .unwrap();
+        store.record_hour(0, &page, 1, "hash").unwrap();
+        store
+    }
+
+    fn dict() -> serde_json::Value {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
+
+    fn json_dict(pairs: &[(&str, i64)]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for (k, v) in pairs {
+            map.insert((*k).to_string(), serde_json::Value::from(*v));
+        }
+        serde_json::Value::Object(map)
+    }
+
+    #[test]
+    fn answers_a_request_that_arrives_in_pieces() {
+        // One read() would leave the tail unread, and closing that socket sends
+        // RST, which the client reports as a reset.
+        let response = one_request(store_with_one_hour(), |client| {
+            client.write_all(b"GET /met").unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            client
+                .write_all(b"rics HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        });
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("poe_exchange_hours 1"), "{response}");
+    }
+
+    #[test]
+    fn healthz_is_ok_after_a_recent_write() {
+        // A catch-up that is still behind the live edge is healthy as long as it
+        // keeps writing, which is what keeps the liveness probe from restarting
+        // the pod mid-backfill.
+        let response = one_request(store_with_one_hour(), |client| {
+            client
+                .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        });
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with("ok\n"), "{response}");
+    }
+
+    #[test]
+    fn healthz_is_stale_before_anything_is_stored() {
+        let response = one_request(ExchangeStore::open_memory().unwrap(), |client| {
+            client
+                .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        });
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
+        assert!(response.ends_with("stale\n"), "{response}");
+    }
+
+    #[test]
+    fn unknown_paths_are_404() {
+        let response = one_request(store_with_one_hour(), |client| {
+            client
+                .write_all(b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        });
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+    }
+}
