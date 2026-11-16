@@ -121,10 +121,17 @@ fn handle(
     // Read up to the end of the request head. One `read` is not enough: behind a
     // proxy or NAT the request can arrive in several segments, and closing a
     // socket with unread bytes makes the kernel answer RST instead of FIN — the
-    // client then reports a reset and discards the response it did get.
+    // client then reports a reset and discards the response it did get. The
+    // deadline bounds the whole read, because the socket timeout above only
+    // bounds each `read`: a client trickling one byte at a time would otherwise
+    // hold the single serving thread and take the liveness probe down with it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     while buf.len() < 8192 {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             break;

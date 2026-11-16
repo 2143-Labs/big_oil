@@ -219,16 +219,12 @@ impl ExchangeStore {
             } else {
                 (a, lo_a, hi_a, lo_b, hi_b, vol_a)
             };
-            let (Some(lo), Some(hi)) = (price(base_lo, chaos_lo), price(base_hi, chaos_hi)) else {
+            let (Some(p_lo), Some(p_hi)) = (price(base_lo, chaos_lo), price(base_hi, chaos_hi))
+            else {
                 continue;
             };
-            // A low side more than 10x under the high is a stray reported fill,
-            // not the market: the Covens league's first hours report a
-            // divine/chaos low of 1 chaos against a high of 158. The stored
-            // ratios are untouched, so this stays revisitable in SQL.
-            let chaos_mid = if hi > lo * 10.0 { hi } else { (lo + hi) / 2.0 };
             out.push(PriceRow {
-                chaos_mid,
+                chaos_mid: chaos_price(p_lo, p_hi),
                 league,
                 item,
                 volume,
@@ -351,6 +347,39 @@ impl ExchangeStore {
     }
 }
 
+/// A chaos price from the two reported rates, without trusting which end is
+/// which.
+///
+/// The API reports a `lowest` and a `highest` ratio per side, and which of the
+/// two produces the higher chaos price depends on the server's pair order: in
+/// 44% of the sampled markets the "lowest"-derived price is the higher one. So
+/// they are ordered first, and the midpoint needs no direction at all.
+///
+/// When the two still disagree by more than 10x, one of them is a trade at
+/// parity, which cannot be this item's market price: a Divine quoted at one
+/// chaos (the observed low against a high of 158) or a Fusing whose best offer
+/// is one chaos for one fusing while the other end says 1:40. Parity is the end
+/// to drop. Rates that disagree without parity keep the midpoint: there is no
+/// evidence which end is wrong.
+///
+/// Only the derived price is affected; the stored ratios keep both ends.
+fn chaos_price(p_lo: f64, p_hi: f64) -> f64 {
+    let (lo, hi) = if p_lo <= p_hi {
+        (p_lo, p_hi)
+    } else {
+        (p_hi, p_lo)
+    };
+    if hi > lo * 10.0 {
+        if (lo - 1.0).abs() < 1e-9 {
+            return hi;
+        }
+        if (hi - 1.0).abs() < 1e-9 {
+            return lo;
+        }
+    }
+    (lo + hi) / 2.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +428,53 @@ mod tests {
         assert_eq!(store.hour_count().unwrap(), 1);
         assert_eq!(store.count_for_hour(0).unwrap(), 1);
         assert_eq!(store.ledger().unwrap()[0].sha256, "h2");
+    }
+
+    #[test]
+    fn the_midpoint_does_not_depend_on_which_end_is_reported_first() {
+        assert!((chaos_price(130.0, 150.0) - 140.0).abs() < 1e-9);
+        assert!((chaos_price(150.0, 130.0) - 140.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_parity_offer_is_dropped_from_either_end() {
+        // Divine: one chaos against a high of 158.
+        assert!((chaos_price(1.0, 158.0) - 158.0).abs() < 1e-9);
+        // Fusing: a one-for-one offer against 40 fusing per chaos.
+        assert!((chaos_price(0.025, 1.0) - 0.025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_wide_spread_without_parity_keeps_the_midpoint() {
+        assert!((chaos_price(2.0, 40.0) - 21.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_cheap_item_is_not_priced_at_parity() {
+        // The real fusing market of 2026-11-16 05:00 UTC in Standard: chaos
+        // 1/1, fusing 40/1. The parity end is a stray one-for-one trade; the
+        // other end is ~0.025 chaos per fusing.
+        const FUSING: &str = "Metadata/Items/Currency/CurrencyRerollSocketLinks";
+        let mut store = ExchangeStore::open_memory().unwrap();
+        let page: Page = serde_json::from_value(json!({
+            "next_change_id": 1,
+            "markets": [{
+                "league": "Standard",
+                "market_id": format!("{CHAOS}|{FUSING}"),
+                "market_pair": [CHAOS, FUSING],
+                "volume_traded": {CHAOS: 22, FUSING: 500},
+                "lowest_ratio": {CHAOS: 1, FUSING: 40},
+                "highest_ratio": {CHAOS: 1, FUSING: 1},
+            }]
+        }))
+        .unwrap();
+        store.record_hour(0, &page, 1, "h").unwrap();
+        let prices = store.markets_at(0).unwrap();
+        assert_eq!(prices.len(), 1);
+        assert!(
+            (prices[0].chaos_mid - 0.025).abs() < 1e-9,
+            "{:?}",
+            prices[0]
+        );
     }
 }
