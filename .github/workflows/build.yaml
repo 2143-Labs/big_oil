@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Gate: format, clippy, tests
+      - name: "Gate: format, clippy, tests"
         shell: bash
         run: |
           set -euo pipefail
