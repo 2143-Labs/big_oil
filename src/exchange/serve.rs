@@ -118,12 +118,30 @@ fn handle(
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf)?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let path = request.split_whitespace().nth(1).unwrap_or_default();
+    // Read up to the end of the request head. One `read` is not enough: behind a
+    // proxy or NAT the request can arrive in several segments, and closing a
+    // socket with unread bytes makes the kernel answer RST instead of FIN — the
+    // client then reports a reset and discards the response it did get.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    while buf.len() < 8192 {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&buf);
+    let path = request
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
     let now = crate::store::unix_now();
-    let (status, content_type, body) = match path {
+    let (status, content_type, body) = match path.as_str() {
         "/metrics" => (
             "200 OK",
             "text/plain; version=0.0.4",
