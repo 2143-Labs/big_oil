@@ -1,0 +1,63 @@
+name: build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  registry: ghcr.io/2143-labs
+  repo: big-oil
+
+jobs:
+  build:
+    # Read-only, but it executes repository code on the self-hosted runner: a
+    # fork PR must not run there.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, nixos]
+    # The first build compiles rusqlite's bundled SQLite from C with a cold
+    # cache; the runner keeps a persistent layer cache, so later builds are
+    # minutes. 45 rather than the usual 30 for that first one.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Gate: format, clippy, tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc nixpkgs#clippy nixpkgs#rustfmt --command bash -c 'cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test'
+
+      - name: Docker login
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build, push, and resolve digest
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_number }}"
+          IMAGE="${{ env.registry }}/${{ env.repo }}:${TAG}"
+          # No registry cache flags: the self-hosted runner's `docker` is a
+          # Podman/buildah shim that rejects buildx's registry-cache syntax. The
+          # local layer cache on the runner does the same job.
+          docker build -t "$IMAGE" .
+          digest_file="$(mktemp "${RUNNER_TEMP:-/tmp}/big-oil-digest.XXXXXX")"
+          trap 'rm -f "$digest_file"' EXIT
+          docker push --digestfile "$digest_file" "$IMAGE"
+          digest="$(tr -d '\r\n' < "$digest_file")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "Push did not return a valid top-level image digest" >&2
+            exit 1
+          }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
