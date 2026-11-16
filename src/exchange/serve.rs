@@ -20,6 +20,10 @@ const BOUNDARY_GRACE: i64 = 120;
 /// The hours of silence after which `/healthz` reports stale.
 const STALE_AFTER: i64 = 3 * HOUR;
 
+/// How recently an hour must have been written for a catch-up to count as
+/// healthy. One hour takes about two seconds, so this is a generous margin.
+const PROGRESS_WINDOW: i64 = 900;
+
 pub fn run(
     db: PathBuf,
     base: String,
@@ -129,7 +133,13 @@ fn handle(
             let fresh = store
                 .newest_hour()?
                 .is_some_and(|hour| hour >= current_hour(now) - STALE_AFTER);
-            if fresh {
+            // A catch-up writes one hour every few seconds while it is behind
+            // the live edge, so a recent write also means healthy: otherwise a
+            // backfill of hundreds of hours would trip the liveness probe.
+            let writing = store
+                .newest_fetch_at()?
+                .is_some_and(|at| now - at < PROGRESS_WINDOW);
+            if fresh || writing {
                 ("200 OK", "text/plain", "ok\n".to_string())
             } else {
                 (

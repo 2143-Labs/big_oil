@@ -156,6 +156,18 @@ impl ExchangeStore {
             .query_row("SELECT COUNT(*) FROM exchange_hour", [], |r| r.get(0))?)
     }
 
+    /// When the newest ledger row was written: the liveness signal that a
+    /// backfill is still making progress.
+    pub fn newest_fetch_at(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(fetched_at) FROM exchange_hour", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
     pub fn count_for_hour(&self, hour: i64) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM exchange_market WHERE hour = ?1",
