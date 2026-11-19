@@ -361,8 +361,8 @@ big_oil [--exchange-db PATH] exchange <command>
 fetch    Store every hour from the live edge back to --since (--since, --base-url,
          --pace-ms). Stored hours are skipped without a request, so --since also
          repairs a hole.
-serve    Collect an hour at a time, forever, and serve /metrics and /healthz on
-         --listen (default 127.0.0.1:9100). --since applies to an empty database
+serve    Collect an hour at a time, forever, and serve /metrics, /healthz and
+         the /v1 price API on --listen (default 127.0.0.1:9100). --since applies to an empty database
          only: a restart must never silently re-backfill.
 verify   Prove the stored hours are contiguous and that every ledger row still
          has its markets. Prints each problem ("missing <hour>", "ledger says N
@@ -388,6 +388,39 @@ Each raw payload is also archived gzipped in `exchange-raw/` beside the database
 history may be removed. The ledger stores a sha256 of the uncompressed payload,
 so `exchange verify --recheck` can prove an archived hour still matches what the
 API serves.
+
+### Currency exchange API
+
+`exchange serve` also answers two read-only JSON routes, published at
+`https://big-oil.john2143.com`. `/v1` is served directly to any client; every
+other path there sits behind an Anubis browser challenge.
+
+```
+GET /v1/leagues                          public leagues in the newest stored hour
+GET /v1/prices?league=&hours=&item=      hourly chaos prices per item
+```
+
+- `league` defaults to `Covens` (or the busiest public league when Covens is
+  absent); an unknown league is a 404.
+- `hours` defaults to 24, at most 168. It counts *stored* hours back from the
+  newest one, not the clock: a collector that is behind returns its last
+  `hours` stored hours, and a missing hour simply has no point.
+- `item` narrows the answer to one item id; no match is an empty `items`.
+
+Each point is one hour of one item: `chaos` is the price used by `/metrics`,
+`low`/`high` the two ends it was derived from (equal when a parity trade was
+dropped), and `volume` the units of the item traded that hour. Only items with a
+direct chaos market appear.
+
+```
+$ curl -s 'https://big-oil.john2143.com/v1/prices?hours=1&item=Metadata/Items/Currency/CurrencyModValues'
+{"league":"Covens","generated_at":1795049796,"newest_hour":1795042800,"from":1795042800,"to":1795042800,"hours":1,
+ "items":[{"item":"Metadata/Items/Currency/CurrencyModValues","points":[{"hour":1795042800,"chaos":115.5,"low":11.0,"high":220.0,"volume":45517}]}]}
+```
+
+Private leagues (GGG names them `<name> (PL<digits>)`) are never listed and are
+answered with the same 404 as a league that does not exist. Responses carry
+`Cache-Control: public, max-age=60`.
 
 ## Build
 

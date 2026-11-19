@@ -377,7 +377,7 @@ enum ExchangeCommand {
         #[arg(long, default_value_t = 1000)]
         pace_ms: u64,
     },
-    /// Collect an hour at a time and serve /metrics and /healthz (long running)
+    /// Collect an hour at a time and serve /metrics, /healthz and the /v1 price API (long running)
     Serve {
         /// First hour, only honoured when the database is empty
         #[arg(long)]

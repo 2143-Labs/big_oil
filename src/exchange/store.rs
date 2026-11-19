@@ -79,6 +79,17 @@ pub struct PriceRow {
     pub volume: i64,
 }
 
+/// One (hour, item) point of a league's price series.
+#[derive(Debug, Clone)]
+pub struct SeriesRow {
+    pub hour: i64,
+    pub item: String,
+    pub chaos_mid: f64,
+    pub chaos_low: f64,
+    pub chaos_high: f64,
+    pub volume: i64,
+}
+
 pub struct ExchangeStore {
     conn: Connection,
 }
@@ -98,6 +109,17 @@ impl ExchangeStore {
 
     pub fn open_memory() -> Result<Self> {
         Self::from_conn(Connection::open_in_memory()?)
+    }
+
+    /// A connection that never writes, for the HTTP side. It runs no schema and
+    /// no meta upsert, so it must be opened after [`ExchangeStore::open`] has
+    /// created the file (and, in WAL mode, its `-wal`/`-shm` companions).
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening database {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(15))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self { conn })
     }
 
     fn from_conn(conn: Connection) -> Result<Self> {
@@ -209,24 +231,64 @@ impl ExchangeStore {
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             let league: String = r.get(0)?;
-            let a: String = r.get(1)?;
-            let b: String = r.get(2)?;
-            let (lo_a, hi_a, lo_b, hi_b): (i64, i64, i64, i64) =
-                (r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?);
-            let (vol_a, vol_b): (i64, i64) = (r.get(7)?, r.get(8)?);
-            let (item, base_lo, base_hi, chaos_lo, chaos_hi, volume) = if a == CHAOS {
-                (b, lo_b, hi_b, lo_a, hi_a, vol_b)
-            } else {
-                (a, lo_a, hi_a, lo_b, hi_b, vol_a)
-            };
-            let (Some(p_lo), Some(p_hi)) = (price(base_lo, chaos_lo), price(base_hi, chaos_hi))
-            else {
+            let Some((item, (_, chaos_mid, _), volume)) = chaos_band_row(
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ) else {
                 continue;
             };
             out.push(PriceRow {
-                chaos_mid: chaos_price(p_lo, p_hi),
+                chaos_mid,
                 league,
                 item,
+                volume,
+            });
+        }
+        Ok(out)
+    }
+
+    /// One league's chaos-quoted items across an inclusive hour range, newest
+    /// hour first.
+    pub fn prices_range(&self, league: &str, from: i64, to: i64) -> Result<Vec<SeriesRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.hour, p.a, p.b, m.ratio_lo_a, m.ratio_hi_a, m.ratio_lo_b,
+                    m.ratio_hi_b, m.vol_a, m.vol_b
+             FROM exchange_market m
+             JOIN exchange_league l ON l.id = m.league_id
+             JOIN exchange_pair p ON p.id = m.pair_id
+             WHERE m.hour BETWEEN ?1 AND ?2
+               AND (p.a = ?3 OR p.b = ?3)
+               AND l.name = ?4
+             ORDER BY m.hour DESC, p.a, p.b",
+        )?;
+        let mut rows = stmt.query(params![from, to, CHAOS, league])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let hour: i64 = r.get(0)?;
+            let Some((item, (chaos_low, chaos_mid, chaos_high), volume)) = chaos_band_row(
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ) else {
+                continue;
+            };
+            out.push(SeriesRow {
+                hour,
+                item,
+                chaos_mid,
+                chaos_low,
+                chaos_high,
                 volume,
             });
         }
@@ -347,8 +409,31 @@ impl ExchangeStore {
     }
 }
 
-/// A chaos price from the two reported rates, without trusting which end is
-/// which.
+/// The item and its chaos `(low, mid, high)` and volume for one market row,
+/// whichever side chaos is on. `None` when either end has an unusable ratio.
+#[allow(clippy::too_many_arguments)]
+fn chaos_band_row(
+    a: String,
+    b: String,
+    lo_a: i64,
+    hi_a: i64,
+    lo_b: i64,
+    hi_b: i64,
+    vol_a: i64,
+    vol_b: i64,
+) -> Option<(String, (f64, f64, f64), i64)> {
+    let (item, base_lo, base_hi, chaos_lo, chaos_hi, volume) = if a == CHAOS {
+        (b, lo_b, hi_b, lo_a, hi_a, vol_b)
+    } else {
+        (a, lo_a, hi_a, lo_b, hi_b, vol_a)
+    };
+    let p_lo = price(base_lo, chaos_lo)?;
+    let p_hi = price(base_hi, chaos_hi)?;
+    Some((item, chaos_band(p_lo, p_hi), volume))
+}
+
+/// A chaos price band `(low, mid, high)` from the two reported rates, without
+/// trusting which end is which.
 ///
 /// The API reports a `lowest` and a `highest` ratio per side, and which of the
 /// two produces the higher chaos price depends on the server's pair order: in
@@ -359,11 +444,11 @@ impl ExchangeStore {
 /// parity, which cannot be this item's market price: a Divine quoted at one
 /// chaos (the observed low against a high of 158) or a Fusing whose best offer
 /// is one chaos for one fusing while the other end says 1:40. Parity is the end
-/// to drop. Rates that disagree without parity keep the midpoint: there is no
-/// evidence which end is wrong.
+/// to drop, and the band collapses onto the other end. Rates that disagree
+/// without parity keep the midpoint: there is no evidence which end is wrong.
 ///
 /// Only the derived price is affected; the stored ratios keep both ends.
-fn chaos_price(p_lo: f64, p_hi: f64) -> f64 {
+fn chaos_band(p_lo: f64, p_hi: f64) -> (f64, f64, f64) {
     let (lo, hi) = if p_lo <= p_hi {
         (p_lo, p_hi)
     } else {
@@ -371,13 +456,13 @@ fn chaos_price(p_lo: f64, p_hi: f64) -> f64 {
     };
     if hi > lo * 10.0 {
         if (lo - 1.0).abs() < 1e-9 {
-            return hi;
+            return (hi, hi, hi);
         }
         if (hi - 1.0).abs() < 1e-9 {
-            return lo;
+            return (lo, lo, lo);
         }
     }
-    (lo + hi) / 2.0
+    (lo, (lo + hi) / 2.0, hi)
 }
 
 #[cfg(test)]
@@ -432,21 +517,21 @@ mod tests {
 
     #[test]
     fn the_midpoint_does_not_depend_on_which_end_is_reported_first() {
-        assert!((chaos_price(130.0, 150.0) - 140.0).abs() < 1e-9);
-        assert!((chaos_price(150.0, 130.0) - 140.0).abs() < 1e-9);
+        assert!((chaos_band(130.0, 150.0).1 - 140.0).abs() < 1e-9);
+        assert!((chaos_band(150.0, 130.0).1 - 140.0).abs() < 1e-9);
     }
 
     #[test]
     fn a_parity_offer_is_dropped_from_either_end() {
         // Divine: one chaos against a high of 158.
-        assert!((chaos_price(1.0, 158.0) - 158.0).abs() < 1e-9);
+        assert_eq!(chaos_band(1.0, 158.0), (158.0, 158.0, 158.0));
         // Fusing: a one-for-one offer against 40 fusing per chaos.
-        assert!((chaos_price(0.025, 1.0) - 0.025).abs() < 1e-9);
+        assert_eq!(chaos_band(0.025, 1.0), (0.025, 0.025, 0.025));
     }
 
     #[test]
     fn a_wide_spread_without_parity_keeps_the_midpoint() {
-        assert!((chaos_price(2.0, 40.0) - 21.0).abs() < 1e-9);
+        assert_eq!(chaos_band(2.0, 40.0), (2.0, 21.0, 40.0));
     }
 
     #[test]
